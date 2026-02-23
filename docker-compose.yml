@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:16
+    container_name: pmops_db
+    restart: always
+    environment:
+      POSTGRES_USER: pmops
+      POSTGRES_PASSWORD: pmops
+      POSTGRES_DB: pmops
+    ports:
+      - "5432:5432"
+    volumes:
+      - pmops_pgdata:/var/lib/postgresql/data
+
+volumes:
+  pmops_pgdata:
