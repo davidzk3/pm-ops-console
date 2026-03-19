@@ -21,6 +21,10 @@ type PageProps = {
   params: Promise<{
     marketId: string;
   }>;
+  searchParams: Promise<{
+    title?: string;
+    url?: string;
+  }>;
 };
 
 type CohortItem = {
@@ -213,8 +217,12 @@ function cohortShare(
   return cohort.traders / totalTraders;
 }
 
-export default async function MarketDetailPage({ params }: PageProps) {
+export default async function MarketDetailPage({
+  params,
+  searchParams,
+}: PageProps) {
   const { marketId } = await params;
+  const resolvedSearchParams = await searchParams;
 
   let snapshot;
   let error: string | null = null;
@@ -244,6 +252,16 @@ export default async function MarketDetailPage({ params }: PageProps) {
   const social = snapshot.social_intelligence || {};
   const sameDay = snapshot.traders?.same_day || {};
   const rollingWindow = snapshot.traders?.rolling_window || {};
+
+  const displayTitle =
+    market.title ||
+    resolvedSearchParams.title ||
+    marketId;
+
+  const displayUrl =
+    market.url ||
+    resolvedSearchParams.url ||
+    "";
 
   const participationQuality =
     launch.participation_quality_score !== null &&
@@ -370,17 +388,17 @@ export default async function MarketDetailPage({ params }: PageProps) {
         <div className="mt-1 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div>
             <h1 className="text-2xl font-semibold text-zinc-900">
-              {market.title || marketId}
+              {displayTitle}
             </h1>
 
             <p className="mt-2 text-sm text-zinc-600">
               {market.protocol || "—"} · {market.chain || "—"}
             </p>
 
-            {market.url ? (
+            {displayUrl ? (
               <div className="mt-3">
                 <a
-                  href={market.url}
+                  href={displayUrl}
                   target="_blank"
                   rel="noreferrer"
                   className="text-sm font-medium text-blue-600 hover:underline"
