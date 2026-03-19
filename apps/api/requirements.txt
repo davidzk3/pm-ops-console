@@ -5,3 +5,4 @@ passlib[bcrypt]
 python-multipart
 websockets>=12.0
 psycopg[binary]
+requests
