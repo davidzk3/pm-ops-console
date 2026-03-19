@@ -3268,7 +3268,6 @@ def admin_compute_market_risk_radar_daily(
 def admin_compute_market_integrity_daily(
     day: Optional[date] = Query(default=None),
     limit_markets: int = Query(default=500, ge=1, le=5000),
-    operator: AuthUser = Depends(require_operator),
 ):
     return compute_market_integrity_daily(
         day=day,
