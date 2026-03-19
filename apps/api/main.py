@@ -3286,7 +3286,6 @@ def admin_compute_market_manipulation(
 def admin_compute_market_launch_intelligence(
     day: Optional[date] = Query(default=None),
     limit_markets: int = Query(default=500, ge=1, le=5000),
-    operator: AuthUser = Depends(require_operator),
 ):
     return compute_market_launch_intelligence_daily(
         day=day,
@@ -3297,7 +3296,6 @@ def admin_compute_market_launch_intelligence(
 def admin_compute_market_social_intelligence(
     day: Optional[date] = Query(default=None),
     limit_markets: int = Query(default=500, ge=1, le=5000),
-    operator: AuthUser = Depends(require_operator),
 ):
     return compute_market_social_intelligence_daily(
         day=day,
