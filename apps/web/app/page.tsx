@@ -113,6 +113,10 @@ export default async function HomePage() {
     .slice(0, 30);
 
   return (
+    <div className="...">
+      <div className="w-full bg-gray-900 text-gray-200 text-sm text-center py-2 border-b border-gray-800">
+        This is a live demo environment. The backend may take a few seconds to initialize on first load. If the page doesn’t load immediately, please wait briefly and refresh.
+      </div>
     <div className="mx-auto max-w-5xl space-y-8">
       <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
         <p className="text-sm font-medium text-zinc-500">
