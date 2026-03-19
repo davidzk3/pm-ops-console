@@ -2535,7 +2535,6 @@ LIMIT %s;
 def create_incident(
     market_id: str,
     payload: IncidentCreate,
-    operator: AuthUser = Depends(require_operator),
 ):
     created_by = operator.email
 
@@ -2645,7 +2644,6 @@ LIMIT %s;
 def update_incident_status(
     incident_id: int,
     payload: IncidentStatusUpdate,
-    operator: AuthUser = Depends(require_operator),
 ):
     created_by = operator.email
 
@@ -3058,7 +3056,6 @@ def normalize_params(action_code: str, params: dict | None) -> dict:
 def create_intervention(
     market_id: str,
     payload: InterventionCreate,
-    operator: AuthUser = Depends(require_operator),
 ):
     created_by = operator.email
 
@@ -3167,7 +3164,6 @@ def apply_intervention(intervention_id: int, operator: AuthUser = Depends(requir
 def admin_ingest_polymarket_markets(
     limit: int = 200,
     offset: int = 0,
-    operator: AuthUser = Depends(require_operator),
 ):
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
@@ -3256,7 +3252,6 @@ def admin_compute_trader_labels_daily(
 def admin_compute_market_risk_radar_daily(
     day: Optional[date] = Query(default=None),
     limit_markets: int = Query(default=500, ge=1, le=5000),
-    operator: AuthUser = Depends(require_operator),
 ):
     return compute_market_risk_radar_daily(
         day=day,
@@ -3340,7 +3335,6 @@ def admin_ingest_polymarket_metrics_daily(
 def admin_ingest_polymarket_trades_rest(
     lookback_hours: int = Query(72, ge=1, le=720),
     use_cursor: bool = Query(True),
-    operator: AuthUser = Depends(require_operator),
 ):
     return ingest_polymarket_trades_rest_job(
         lookback_hours=lookback_hours,
@@ -3351,7 +3345,6 @@ def admin_ingest_polymarket_trades_rest(
 def admin_ingest_polymarket_trades_rest_one(
     market_id: str,
     lookback_hours: int = Query(240, ge=1, le=720),
-    operator: AuthUser = Depends(require_operator),
 ):
     return ingest_polymarket_trades_rest_for_market_job(
         market_id=market_id,
@@ -3373,7 +3366,6 @@ def admin_ingest_polymarket_trades_ws(
 def admin_ingest_polymarket_trades_rest_one(
     market_id: str,
     lookback_hours: int = Query(240, ge=1, le=720),
-    operator: AuthUser = Depends(require_operator),
 ):
     return ingest_polymarket_trades_rest_for_market(
         market_id=market_id,
