@@ -7,24 +7,30 @@ type FetchJSONOptions = RequestInit & {
   write?: boolean;
 };
 
+type APIErrorResponse = {
+  error?: {
+    code?: string;
+    message?: string;
+    details?: unknown;
+  };
+};
+
 export async function fetchJSON<T>(
   path: string,
   opts: FetchJSONOptions = {}
 ): Promise<T> {
-  const { write, headers, ...rest } = opts;
+  const { write = false, headers, ...rest } = opts;
 
-  const finalHeaders: Record<string, string> = {
-    ...(headers as Record<string, string> | undefined),
-  };
+  const finalHeaders = new Headers(headers);
 
-  // only set content-type when we actually send a body
   if (rest.body !== undefined && rest.body !== null) {
-    finalHeaders["Content-Type"] = "application/json";
+    if (!finalHeaders.has("Content-Type")) {
+      finalHeaders.set("Content-Type", "application/json");
+    }
   }
 
   if (write && DEMO_KEY) {
-    // must match your FastAPI dependency name
-    finalHeaders["X-Demo-Key"] = DEMO_KEY;
+    finalHeaders.set("X-Demo-Key", DEMO_KEY);
   }
 
   const res = await fetch(`${API_BASE}${path}`, {
@@ -37,9 +43,21 @@ export async function fetchJSON<T>(
   const isJson = contentType.includes("application/json");
 
   if (!res.ok) {
-    const data = isJson ? await res.json().catch(() => null) : null;
-    throw new Error(data?.error?.message || `Request failed (${res.status})`);
+    let message = `Request failed (${res.status})`;
+
+    if (isJson) {
+      const data = (await res.json().catch(() => null)) as APIErrorResponse | null;
+      if (data?.error?.message) {
+        message = data.error.message;
+      }
+    }
+
+    throw new Error(message);
   }
 
-  return (isJson ? await res.json() : (null as any)) as T;
+  if (!isJson) {
+    return null as T;
+  }
+
+  return (await res.json()) as T;
 }

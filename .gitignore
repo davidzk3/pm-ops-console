@@ -2,17 +2,16 @@
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .venv/
-env/
 
 # Node
 node_modules/
 .next/
 
+# Env
+.env
+
 # OS
 .DS_Store
 Thumbs.db
-
-# Env files
-.env
-.env.local

@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { fetchJSON } from "../../lib/api";
+import { fetchJSON } from "../../lib (rename back to lib)/api";
 
 type IncidentStatus = "OPEN" | "MONITOR" | "RESOLVED";
 type InterventionStatus = "PLANNED" | "APPLIED" | "REVERTED" | "CANCELLED";
@@ -43,8 +43,9 @@ type EffectBlock = {
 };
 
 type InterventionEffect = {
-  id: number; // intervention id
+  id: number;
   market_id: string;
+  incident_id?: number | null;
   day: string;
   status: string;
   action_code: string;
@@ -52,10 +53,16 @@ type InterventionEffect = {
   created_by: string;
   created_at: string;
   applied_at: string | null;
+  applied_day?: string | null;
   after_day?: string | null;
+  before_day?: string | null;
+  action_count?: number | null;
+  params?: any;
   before?: EffectBlock | null;
   after?: EffectBlock | null;
   delta?: EffectBlock | null;
+  delta_score?: number | null;
+  roi_score?: number | null;
 };
 
 type CumulativeImpact = {
@@ -91,10 +98,12 @@ function safeParseJSON(raw: string) {
   if (!s) return {};
   try {
     const v = JSON.parse(s);
-    if (v && typeof v === "object") return v;
+    if (v && typeof v === "object" && !Array.isArray(v)) return v;
     throw new Error("JSON must be an object");
   } catch (e: any) {
-    throw new Error(e?.message ? `Params JSON error: ${e.message}` : "Params must be valid JSON");
+    throw new Error(
+      e?.message ? `Params JSON error: ${e.message}` : "Params must be valid JSON",
+    );
   }
 }
 
@@ -113,23 +122,55 @@ function fmtFloat(x: any, digits = 4) {
 }
 
 function isGoodDelta(metric: string, d: number) {
-  // down is good for these
   const goodWhenDown = new Set(["spread_median", "concentration_hhi", "risk_score"]);
   return goodWhenDown.has(metric) ? d < 0 : d > 0;
 }
 
-function DeltaPill(props: { label: string; metric: string; value: any; digits?: number }) {
+function hasMeaningfulDelta(delta?: EffectBlock | null) {
+  if (!delta) return false;
+  return [
+    delta.risk_score,
+    delta.health_score,
+    delta.spread_median,
+    delta.depth_2pct_median,
+    delta.concentration_hhi,
+    delta.unique_traders,
+    delta.volume,
+    delta.trades,
+  ].some((v) => typeof v === "number" && Number.isFinite(v));
+}
+
+function DeltaPill(props: {
+  label: string;
+  metric: string;
+  value: any;
+  digits?: number;
+}) {
   const { label, metric, value, digits } = props;
 
-  if (value === null || value === undefined || typeof value !== "number" || Number.isNaN(value)) {
-    return <span className="text-xs px-2 py-0.5 rounded-full border bg-gray-50 text-gray-500">{label}: n/a</span>;
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value !== "number" ||
+    Number.isNaN(value)
+  ) {
+    return (
+      <span className="text-xs px-2 py-0.5 rounded-full border bg-gray-50 text-gray-500 border-gray-200">
+        {label}: n/a
+      </span>
+    );
   }
 
   const good = isGoodDelta(metric, value);
-  const cls = good ? "bg-green-50 text-green-800 border-green-200" : "bg-red-50 text-red-800 border-red-200";
+  const cls = good
+    ? "bg-green-50 text-green-800 border-green-200"
+    : "bg-red-50 text-red-800 border-red-200";
 
   const sign = value > 0 ? "+" : "";
-  const pretty = metric.includes("spread") || metric.includes("hhi") ? `${sign}${fmtFloat(value, digits ?? 4)}` : `${sign}${fmtNumber(value)}`;
+  const pretty =
+    metric.includes("spread") || metric.includes("hhi")
+      ? `${sign}${fmtFloat(value, digits ?? 4)}`
+      : `${sign}${fmtNumber(value)}`;
 
   return (
     <span className={`text-xs px-2 py-0.5 rounded-full border ${cls}`}>
@@ -145,7 +186,7 @@ function normalizeIncidentStatus(s: any): IncidentStatus {
   return "OPEN";
 }
 
-function statusPill(status: string) {
+function incidentStatusPill(status: string) {
   const s = String(status ?? "").toUpperCase();
   if (s === "RESOLVED") return "bg-green-50 text-green-800 border-green-200";
   if (s === "MONITOR") return "bg-yellow-50 text-yellow-800 border-yellow-200";
@@ -161,12 +202,29 @@ function normalizeInterventionStatus(s: any): InterventionStatus {
   return "PLANNED";
 }
 
+function interventionStatusPill(status: string) {
+  const s = String(status ?? "").toUpperCase();
+  if (s === "APPLIED") return "bg-green-50 text-green-800 border-green-200";
+  if (s === "REVERTED") return "bg-gray-50 text-gray-700 border-gray-200";
+  if (s === "CANCELLED") return "bg-gray-50 text-gray-700 border-gray-200";
+  if (s === "PLANNED") return "bg-blue-50 text-blue-800 border-blue-200";
+  return "bg-gray-50 text-gray-700 border-gray-200";
+}
+
+function EmptyBox({ text }: { text: string }) {
+  return (
+    <div className="rounded-xl border bg-gray-50 px-3 py-3 text-sm text-gray-500">
+      {text}
+    </div>
+  );
+}
+
 export default function OperatorConsolePanel(props: {
   marketId: string;
   incidents: IncidentRow[];
   interventions: InterventionRow[];
   interventionEffects: InterventionEffect[];
-  cumulative?: CumulativeImpact | null; // Step 10A
+  cumulative?: CumulativeImpact | null;
 }) {
   const router = useRouter();
   const today = useMemo(() => todayISO(), []);
@@ -175,7 +233,6 @@ export default function OperatorConsolePanel(props: {
   const interventionsArr = props.interventions ?? [];
   const interventionEffectsArr = props.interventionEffects ?? [];
 
-  // Build fast lookup: intervention_id -> effect row
   const effectById = useMemo(() => {
     const m = new Map<number, InterventionEffect>();
     for (const e of interventionEffectsArr) {
@@ -184,14 +241,22 @@ export default function OperatorConsolePanel(props: {
     return m;
   }, [interventionEffectsArr]);
 
-  // Step 10B: group intervention effectiveness by action_code (sorted by count desc)
   const analyticsByAction = useMemo(() => {
-    const map = new Map<string, { count: number; risk: number[]; health: number[]; spread: number[]; depth: number[] }>();
+    const map = new Map<
+      string,
+      {
+        count: number;
+        risk: number[];
+        health: number[];
+        spread: number[];
+        depth: number[];
+      }
+    >();
 
     for (const e of interventionEffectsArr) {
-      if (!e?.delta) continue;
+      if (!hasMeaningfulDelta(e?.delta)) continue;
 
-      const key = (e.action_code ?? "UNKNOWN").trim() || "UNKNOWN";
+      const key = String(e.action_code ?? "UNKNOWN").trim() || "UNKNOWN";
       if (!map.has(key)) {
         map.set(key, { count: 0, risk: [], health: [], spread: [], depth: [] });
       }
@@ -199,10 +264,12 @@ export default function OperatorConsolePanel(props: {
       const bucket = map.get(key)!;
       bucket.count += 1;
 
-      if (typeof e.delta.risk_score === "number") bucket.risk.push(e.delta.risk_score);
-      if (typeof e.delta.health_score === "number") bucket.health.push(e.delta.health_score);
-      if (typeof e.delta.spread_median === "number") bucket.spread.push(e.delta.spread_median);
-      if (typeof e.delta.depth_2pct_median === "number") bucket.depth.push(e.delta.depth_2pct_median);
+      if (typeof e.delta?.risk_score === "number") bucket.risk.push(e.delta.risk_score);
+      if (typeof e.delta?.health_score === "number") bucket.health.push(e.delta.health_score);
+      if (typeof e.delta?.spread_median === "number") bucket.spread.push(e.delta.spread_median);
+      if (typeof e.delta?.depth_2pct_median === "number") {
+        bucket.depth.push(e.delta.depth_2pct_median);
+      }
     }
 
     function avg(arr: number[]) {
@@ -222,7 +289,6 @@ export default function OperatorConsolePanel(props: {
       .sort((a, b) => b.count - a.count);
   }, [interventionEffectsArr]);
 
-  // incidents newest-first (day desc, created_at desc)
   const incidentsSorted = useMemo(() => {
     const arr = [...incidentsArr];
     arr.sort((a, b) => {
@@ -236,7 +302,6 @@ export default function OperatorConsolePanel(props: {
     return arr;
   }, [incidentsArr]);
 
-  // interventions newest-first (day desc, created_at desc)
   const interventionsSorted = useMemo(() => {
     const arr = [...interventionsArr];
     arr.sort((a, b) => {
@@ -250,19 +315,24 @@ export default function OperatorConsolePanel(props: {
     return arr;
   }, [interventionsArr]);
 
-  // incident form
   const [incidentDay, setIncidentDay] = useState(today);
   const [incidentStatus, setIncidentStatus] = useState<IncidentStatus>("OPEN");
   const [incidentNote, setIncidentNote] = useState("");
   const [incidentCreatedBy, setIncidentCreatedBy] = useState("operator");
 
-  // intervention form
   const [interventionDay, setInterventionDay] = useState(today);
   const [interventionIncidentId, setInterventionIncidentId] = useState<string>("");
   const [actionCode, setActionCode] = useState("LIQUIDITY_BOOST");
   const [title, setTitle] = useState("");
-  const [interventionStatus, setInterventionStatus] = useState<InterventionStatus>("PLANNED");
-  const [paramsJson, setParamsJson] = useState<string>(JSON.stringify({ spread_bps: 10, depth_delta: 500, health_delta: 3, risk_delta: -2 }, null, 2));
+  const [interventionStatus, setInterventionStatus] =
+    useState<InterventionStatus>("PLANNED");
+  const [paramsJson, setParamsJson] = useState<string>(
+    JSON.stringify(
+      { spread_bps: 10, depth_delta: 500, health_delta: 3, risk_delta: -2 },
+      null,
+      2,
+    ),
+  );
   const [interventionCreatedBy, setInterventionCreatedBy] = useState("operator");
 
   const [busy, setBusy] = useState<string | null>(null);
@@ -280,7 +350,7 @@ export default function OperatorConsolePanel(props: {
           day: incidentDay,
           status: incidentStatus,
           note: incidentNote.trim(),
-          created_by: incidentCreatedBy,
+          created_by: incidentCreatedBy.trim() || "operator",
         }),
         write: true,
       });
@@ -294,7 +364,6 @@ export default function OperatorConsolePanel(props: {
     }
   }
 
-  // Update incident status
   async function setIncidentStatusById(incidentId: number, status: IncidentStatus) {
     setErr(null);
     setBusy(`incidentStatus:${incidentId}:${status}`);
@@ -329,7 +398,7 @@ export default function OperatorConsolePanel(props: {
           title: (title || actionCode).trim(),
           status: interventionStatus,
           params: parsedParams,
-          created_by: interventionCreatedBy,
+          created_by: interventionCreatedBy.trim() || "operator",
         }),
         write: true,
       });
@@ -396,43 +465,99 @@ export default function OperatorConsolePanel(props: {
 
   const cum = props.cumulative ?? null;
 
+  const hasCumulative =
+    !!cum &&
+    (typeof cum.count_total === "number" ||
+      typeof cum.count_effective === "number" ||
+      typeof cum.risk_score === "number" ||
+      typeof cum.health_score === "number" ||
+      typeof cum.spread_median === "number" ||
+      typeof cum.depth_2pct_median === "number");
+
+  const hasAnyOperatorHistory =
+    incidentsSorted.length > 0 ||
+    interventionsSorted.length > 0 ||
+    interventionEffectsArr.length > 0 ||
+    hasCumulative;
+
   return (
     <section className="mt-12">
-      <div className="flex items-end justify-between gap-4 mb-3">
+      <div className="flex items-end justify-between gap-4 mb-3 flex-wrap">
         <h2 className="font-medium">Operator workflow</h2>
-        <div className="text-xs text-gray-500">Create then apply interventions</div>
+        <div className="text-xs text-gray-500">
+          Create incidents, plan actions, then apply when needed
+        </div>
       </div>
 
-      {/* Cumulative impact banner */}
-      {cum ? (
+      {!hasAnyOperatorHistory ? (
+        <div className="mb-6 rounded-2xl border bg-white p-4">
+          <div className="font-medium text-sm text-gray-900">
+            No operator history recorded yet
+          </div>
+          <div className="mt-1 text-sm text-gray-500">
+            This is normal for newly live ingested markets. You can open the first incident or
+            create the first intervention from here.
+          </div>
+        </div>
+      ) : null}
+
+      {hasCumulative ? (
         <div className="border rounded-2xl p-4 bg-white mb-6">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <div className="font-medium">Last {cum.days ?? 30} days intervention impact</div>
+              <div className="font-medium">
+                Last {cum?.days ?? 30} days intervention impact
+              </div>
               <div className="text-xs text-gray-500 mt-1">
-                Total: {fmtNumber(cum.count_total ?? "-")} · Effective: {fmtNumber(cum.count_effective ?? "-")}
+                Total: {fmtNumber(cum?.count_total ?? "-")} · Effective:{" "}
+                {fmtNumber(cum?.count_effective ?? "-")}
               </div>
             </div>
 
             <div className="flex flex-wrap gap-2">
-              <DeltaPill label="Δ Risk" metric="risk_score" value={cum.risk_score ?? null} digits={0} />
-              <DeltaPill label="Δ Health" metric="health_score" value={cum.health_score ?? null} digits={0} />
-              <DeltaPill label="Δ Spread" metric="spread_median" value={cum.spread_median ?? null} digits={4} />
-              <DeltaPill label="Δ Depth" metric="depth_2pct_median" value={cum.depth_2pct_median ?? null} digits={0} />
+              <DeltaPill
+                label="Δ Risk"
+                metric="risk_score"
+                value={cum?.risk_score ?? null}
+                digits={0}
+              />
+              <DeltaPill
+                label="Δ Health"
+                metric="health_score"
+                value={cum?.health_score ?? null}
+                digits={0}
+              />
+              <DeltaPill
+                label="Δ Spread"
+                metric="spread_median"
+                value={cum?.spread_median ?? null}
+                digits={4}
+              />
+              <DeltaPill
+                label="Δ Depth"
+                metric="depth_2pct_median"
+                value={cum?.depth_2pct_median ?? null}
+                digits={0}
+              />
             </div>
           </div>
         </div>
       ) : null}
 
-      {err ? <div className="border rounded-xl p-3 mb-4 bg-red-50 border-red-200 text-sm text-red-800">{err}</div> : null}
+      {err ? (
+        <div className="border rounded-xl p-3 mb-4 bg-red-50 border-red-200 text-sm text-red-800">
+          {err}
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Incidents */}
         <div className="border rounded-2xl p-4 bg-white">
           <div className="flex items-center justify-between gap-4">
             <div>
               <div className="font-medium">Create incident</div>
-              <div className="text-xs text-gray-500">POST /ops/markets/{props.marketId}/incidents</div>
+              <div className="text-xs text-gray-500">
+                POST /ops/markets/{props.marketId}/incidents
+              </div>
             </div>
             <button
               onClick={createIncident}
@@ -446,7 +571,12 @@ export default function OperatorConsolePanel(props: {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
             <label className="text-sm">
               Day
-              <input type="date" value={incidentDay} onChange={(e) => setIncidentDay(e.target.value)} className="mt-1 w-full border rounded-xl px-3 py-2" />
+              <input
+                type="date"
+                value={incidentDay}
+                onChange={(e) => setIncidentDay(e.target.value)}
+                className="mt-1 w-full border rounded-xl px-3 py-2"
+              />
             </label>
 
             <label className="text-sm">
@@ -475,7 +605,11 @@ export default function OperatorConsolePanel(props: {
 
             <label className="text-sm md:col-span-2">
               Created by
-              <input value={incidentCreatedBy} onChange={(e) => setIncidentCreatedBy(e.target.value)} className="mt-1 w-full border rounded-xl px-3 py-2" />
+              <input
+                value={incidentCreatedBy}
+                onChange={(e) => setIncidentCreatedBy(e.target.value)}
+                className="mt-1 w-full border rounded-xl px-3 py-2"
+              />
             </label>
           </div>
 
@@ -498,11 +632,17 @@ export default function OperatorConsolePanel(props: {
                     <div key={i.id} className="border rounded-xl p-3 text-sm">
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <div className="font-medium truncate">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <div className="font-medium break-words">
                               #{i.id} · {i.note}
                             </div>
-                            <span className={`text-xs border rounded-full px-2 py-0.5 ${statusPill(st)}`}>{st}</span>
+                            <span
+                              className={`text-xs border rounded-full px-2 py-0.5 ${incidentStatusPill(
+                                st,
+                              )}`}
+                            >
+                              {st}
+                            </span>
                           </div>
                           <div className="text-xs text-gray-500 mt-1">
                             {i.day} · by {i.created_by} · {fmtWhen(i.created_at, i.day)}
@@ -540,17 +680,18 @@ export default function OperatorConsolePanel(props: {
                 })}
               </div>
             ) : (
-              <div className="text-sm text-gray-500 mt-2">No incidents yet</div>
+              <EmptyBox text="No operator incidents recorded yet for this live market." />
             )}
           </div>
         </div>
 
-        {/* Interventions */}
         <div className="border rounded-2xl p-4 bg-white">
           <div className="flex items-center justify-between gap-4">
             <div>
               <div className="font-medium">Create intervention</div>
-              <div className="text-xs text-gray-500">POST /ops/markets/{props.marketId}/interventions</div>
+              <div className="text-xs text-gray-500">
+                POST /ops/markets/{props.marketId}/interventions
+              </div>
             </div>
             <button
               onClick={createIntervention}
@@ -564,14 +705,21 @@ export default function OperatorConsolePanel(props: {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
             <label className="text-sm">
               Day
-              <input type="date" value={interventionDay} onChange={(e) => setInterventionDay(e.target.value)} className="mt-1 w-full border rounded-xl px-3 py-2" />
+              <input
+                type="date"
+                value={interventionDay}
+                onChange={(e) => setInterventionDay(e.target.value)}
+                className="mt-1 w-full border rounded-xl px-3 py-2"
+              />
             </label>
 
             <label className="text-sm">
               Status
               <select
                 value={interventionStatus}
-                onChange={(e) => setInterventionStatus(e.target.value as InterventionStatus)}
+                onChange={(e) =>
+                  setInterventionStatus(e.target.value as InterventionStatus)
+                }
                 className="mt-1 w-full border rounded-xl px-3 py-2"
               >
                 <option value="PLANNED">PLANNED</option>
@@ -583,7 +731,11 @@ export default function OperatorConsolePanel(props: {
 
             <label className="text-sm">
               Link to incident (optional)
-              <select value={interventionIncidentId} onChange={(e) => setInterventionIncidentId(e.target.value)} className="mt-1 w-full border rounded-xl px-3 py-2">
+              <select
+                value={interventionIncidentId}
+                onChange={(e) => setInterventionIncidentId(e.target.value)}
+                className="mt-1 w-full border rounded-xl px-3 py-2"
+              >
                 <option value="">None</option>
                 {incidentsSorted.map((i) => (
                   <option key={i.id} value={String(i.id)}>
@@ -595,7 +747,11 @@ export default function OperatorConsolePanel(props: {
 
             <label className="text-sm">
               Action code
-              <input value={actionCode} onChange={(e) => setActionCode(e.target.value)} className="mt-1 w-full border rounded-xl px-3 py-2" />
+              <input
+                value={actionCode}
+                onChange={(e) => setActionCode(e.target.value)}
+                className="mt-1 w-full border rounded-xl px-3 py-2"
+              />
             </label>
 
             <label className="text-sm md:col-span-2">
@@ -629,13 +785,16 @@ export default function OperatorConsolePanel(props: {
             </label>
           </div>
 
-          {/* Performance summary by action_code */}
           {analyticsByAction.length ? (
             <div className="mt-5 border rounded-2xl p-4 bg-gray-50">
               <div className="flex items-end justify-between gap-4">
                 <div>
-                  <div className="font-medium">Intervention performance (last {cum?.days ?? 30} days)</div>
-                  <div className="text-xs text-gray-500 mt-1">Grouped by action_code, averages computed over deltas.</div>
+                  <div className="font-medium">
+                    Intervention performance (last {cum?.days ?? 30} days)
+                  </div>
+                  <div className="text-xs text-gray-500 mt-1">
+                    Grouped by action_code. Averages are computed from populated deltas only.
+                  </div>
                 </div>
               </div>
 
@@ -644,14 +803,36 @@ export default function OperatorConsolePanel(props: {
                   <div key={a.action} className="border rounded-xl p-3 bg-white text-sm">
                     <div className="flex items-center justify-between gap-3">
                       <div className="font-medium truncate">{a.action}</div>
-                      <div className="text-xs text-gray-500 shrink-0">Count: {a.count}</div>
+                      <div className="text-xs text-gray-500 shrink-0">
+                        Count: {a.count}
+                      </div>
                     </div>
 
                     <div className="mt-2 flex flex-wrap gap-2">
-                      <DeltaPill label="Avg Δ Risk" metric="risk_score" value={a.avgRisk} digits={0} />
-                      <DeltaPill label="Avg Δ Health" metric="health_score" value={a.avgHealth} digits={0} />
-                      <DeltaPill label="Avg Δ Spread" metric="spread_median" value={a.avgSpread} digits={4} />
-                      <DeltaPill label="Avg Δ Depth" metric="depth_2pct_median" value={a.avgDepth} digits={0} />
+                      <DeltaPill
+                        label="Avg Δ Risk"
+                        metric="risk_score"
+                        value={a.avgRisk}
+                        digits={0}
+                      />
+                      <DeltaPill
+                        label="Avg Δ Health"
+                        metric="health_score"
+                        value={a.avgHealth}
+                        digits={0}
+                      />
+                      <DeltaPill
+                        label="Avg Δ Spread"
+                        metric="spread_median"
+                        value={a.avgSpread}
+                        digits={4}
+                      />
+                      <DeltaPill
+                        label="Avg Δ Depth"
+                        metric="depth_2pct_median"
+                        value={a.avgDepth}
+                        digits={0}
+                      />
                     </div>
                   </div>
                 ))}
@@ -676,33 +857,131 @@ export default function OperatorConsolePanel(props: {
 
                   const eff = effectById.get(itv.id);
                   const delta = eff?.delta ?? null;
+                  const hasDelta = hasMeaningfulDelta(delta);
+
+                  let impactText: string | null = null;
+                  if (!hasDelta) {
+                    if (isApplied) {
+                      impactText =
+                        "Applied. Effectiveness will appear once usable daily comparison metrics are available.";
+                    } else {
+                      impactText =
+                        "No effectiveness data yet. This is normal until the action is applied and downstream metrics populate.";
+                    }
+                  }
 
                   return (
                     <div key={itv.id} className="border rounded-xl p-3 text-sm">
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
-                          <div className="font-medium truncate">
-                            #{itv.id} {itv.action_code} <span className="text-xs text-gray-500">({st})</span>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <div className="font-medium break-words">
+                              #{itv.id} · {itv.action_code}
+                            </div>
+                            <span
+                              className={`text-xs border rounded-full px-2 py-0.5 ${interventionStatusPill(
+                                st,
+                              )}`}
+                            >
+                              {st}
+                            </span>
+                            {typeof itv.incident_id === "number" ? (
+                              <span className="text-xs border rounded-full px-2 py-0.5 bg-gray-50 text-gray-700 border-gray-200">
+                                incident #{itv.incident_id}
+                              </span>
+                            ) : null}
                           </div>
-                          <div className="text-xs text-gray-500 truncate">{itv.title}</div>
+
+                          <div className="text-xs text-gray-500 truncate mt-1">
+                            {itv.title}
+                          </div>
+
                           <div className="text-xs text-gray-400 mt-1">
                             {itv.day} · by {itv.created_by} · {fmtWhen(itv.created_at, itv.day)}
-                            {itv.applied_at ? ` · applied ${fmtWhen(itv.applied_at, itv.day)}` : ""}
+                            {itv.applied_at
+                              ? ` · applied ${fmtWhen(itv.applied_at, itv.day)}`
+                              : ""}
                             {eff?.after_day ? ` · compared to ${eff.after_day}` : ""}
                           </div>
 
                           <div className="mt-2 flex flex-wrap gap-2">
-                            {!delta ? (
-                              <span className="text-xs text-gray-400">Impact: n/a (shows once APPLIED and included in effectiveness window)</span>
+                            {!hasDelta ? (
+                              <span className="text-xs text-gray-400">{impactText}</span>
                             ) : (
                               <>
-                                <DeltaPill label="Δ Risk" metric="risk_score" value={delta.risk_score as any} digits={0} />
-                                <DeltaPill label="Δ Health" metric="health_score" value={delta.health_score as any} digits={0} />
-                                <DeltaPill label="Δ Spread" metric="spread_median" value={delta.spread_median as any} digits={4} />
-                                <DeltaPill label="Δ Depth" metric="depth_2pct_median" value={delta.depth_2pct_median as any} digits={0} />
+                                <DeltaPill
+                                  label="Δ Risk"
+                                  metric="risk_score"
+                                  value={delta?.risk_score as any}
+                                  digits={0}
+                                />
+                                <DeltaPill
+                                  label="Δ Health"
+                                  metric="health_score"
+                                  value={delta?.health_score as any}
+                                  digits={0}
+                                />
+                                <DeltaPill
+                                  label="Δ Spread"
+                                  metric="spread_median"
+                                  value={delta?.spread_median as any}
+                                  digits={4}
+                                />
+                                <DeltaPill
+                                  label="Δ Depth"
+                                  metric="depth_2pct_median"
+                                  value={delta?.depth_2pct_median as any}
+                                  digits={0}
+                                />
                               </>
                             )}
                           </div>
+
+                          {eff?.before || eff?.after ? (
+                            <details className="mt-3">
+                              <summary className="text-xs text-gray-600 cursor-pointer select-none">
+                                View effectiveness detail
+                              </summary>
+
+                              <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div className="border rounded-xl p-3 bg-gray-50">
+                                  <div className="text-xs text-gray-500 mb-2">Before</div>
+                                  <div className="flex flex-wrap gap-2">
+                                    <span className="text-xs border rounded px-2 py-0.5 bg-white">
+                                      risk {fmtNumber(eff.before?.risk_score)}
+                                    </span>
+                                    <span className="text-xs border rounded px-2 py-0.5 bg-white">
+                                      health {fmtNumber(eff.before?.health_score)}
+                                    </span>
+                                    <span className="text-xs border rounded px-2 py-0.5 bg-white">
+                                      spread {fmtFloat(eff.before?.spread_median, 4)}
+                                    </span>
+                                    <span className="text-xs border rounded px-2 py-0.5 bg-white">
+                                      depth {fmtNumber(eff.before?.depth_2pct_median)}
+                                    </span>
+                                  </div>
+                                </div>
+
+                                <div className="border rounded-xl p-3 bg-gray-50">
+                                  <div className="text-xs text-gray-500 mb-2">After</div>
+                                  <div className="flex flex-wrap gap-2">
+                                    <span className="text-xs border rounded px-2 py-0.5 bg-white">
+                                      risk {fmtNumber(eff.after?.risk_score)}
+                                    </span>
+                                    <span className="text-xs border rounded px-2 py-0.5 bg-white">
+                                      health {fmtNumber(eff.after?.health_score)}
+                                    </span>
+                                    <span className="text-xs border rounded px-2 py-0.5 bg-white">
+                                      spread {fmtFloat(eff.after?.spread_median, 4)}
+                                    </span>
+                                    <span className="text-xs border rounded px-2 py-0.5 bg-white">
+                                      depth {fmtNumber(eff.after?.depth_2pct_median)}
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+                            </details>
+                          ) : null}
                         </div>
 
                         <div className="flex items-center gap-2 shrink-0">
@@ -711,7 +990,11 @@ export default function OperatorConsolePanel(props: {
                             disabled={busy !== null || !canApply}
                             className="text-xs px-3 py-2 rounded-xl border bg-gray-50 hover:bg-gray-100 disabled:opacity-50"
                           >
-                            {busy === `apply:${itv.id}` ? "Applying..." : isApplied ? "Applied" : "Apply"}
+                            {busy === `apply:${itv.id}`
+                              ? "Applying..."
+                              : isApplied
+                                ? "Applied"
+                                : "Apply"}
                           </button>
 
                           <button
@@ -733,15 +1016,19 @@ export default function OperatorConsolePanel(props: {
                       </div>
 
                       <details className="mt-3">
-                        <summary className="text-xs text-gray-600 cursor-pointer select-none">View params</summary>
-                        <pre className="mt-2 text-xs bg-gray-50 border rounded-xl p-3 overflow-x-auto">{JSON.stringify(itv.params ?? {}, null, 2)}</pre>
+                        <summary className="text-xs text-gray-600 cursor-pointer select-none">
+                          View params
+                        </summary>
+                        <pre className="mt-2 text-xs bg-gray-50 border rounded-xl p-3 overflow-x-auto">
+                          {JSON.stringify(itv.params ?? {}, null, 2)}
+                        </pre>
                       </details>
                     </div>
                   );
                 })}
               </div>
             ) : (
-              <div className="text-sm text-gray-500 mt-2">No interventions yet</div>
+              <EmptyBox text="No interventions recorded yet for this live market." />
             )}
           </div>
         </div>

@@ -1,8 +1,10 @@
+from datetime import date
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg.types.json import Json
+from fastapi.encoders import jsonable_encoder
 
 import os
 import time
@@ -10,11 +12,35 @@ import json
 import psycopg
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
+from apps.api.db import get_db_dsn
 
+from apps.api.ingest.polymarket_trades_rest import ingest_polymarket_trades_rest_for_market
+from apps.api.ingest.runner import ingest_polymarket_markets
+from apps.api.ingest.runner import ingest_polymarket_trades_ws
+from apps.api.ingest.runner import ingest_polymarket_trades_rest_job
+from apps.api.ingest.runner import ingest_polymarket_bbo_ws_for_market
+from apps.api.ingest.runner import ingest_polymarket_metrics_daily
+from apps.api.ops.microstructure import compute_microstructure_daily
+from apps.api.ops.traders import compute_trader_daily_stats, compute_trader_labels_daily
+from apps.api.services.trader_behavior import compute_trader_behavior_daily
+from apps.api.services.trader_role import compute_trader_role_daily
+from apps.api.ingest.runner import ingest_polymarket_trades_rest_for_market_job
+from apps.api.services.market_risk_radar import compute_market_risk_radar_daily
+from apps.api.services.market_integrity import compute_market_integrity_daily
+from apps.api.services.market_regime_v2 import compute_market_regime_daily_v2
+from apps.api.services.market_manipulation import compute_market_manipulation_daily
+from apps.api.services.market_launch_intelligence import compute_market_launch_intelligence_daily
+from apps.api.services.market_social_intelligence import compute_market_social_intelligence_daily
+from apps.api.ops.integrity_history import router as integrity_history_router
+from apps.api.web.microstructure import router as microstructure_router
 from .settings import CORS_ORIGINS
-from .auth import require_write_key
+from .auth import require_operator, AuthUser
 
-app = FastAPI()
+from fastapi.responses import ORJSONResponse
+app = FastAPI(default_response_class=ORJSONResponse)
+
+app.include_router(microstructure_router)
+app.include_router(integrity_history_router)
 
 # -----------------------------
 # CORS (only add ONCE)
@@ -26,12 +52,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# -----------------------------
-# DB config
-# -----------------------------
-def get_db_dsn() -> str:
-    return os.getenv("DATABASE_URL", "postgresql://pmops:pmops@localhost:5432/pmops")
 
 # -----------------------------
 # Request logging middleware
@@ -78,14 +98,16 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
         details={"errors": exc.errors()},
     )
 
+import traceback
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(_: Request, exc: Exception):
-    print(f"[unhandled] {type(exc).__name__}: {exc}")
+    traceback.print_exc()
     return error_response(
         code="internal_error",
         message="Internal server error",
         status_code=500,
-        details={},
+        details={"type": type(exc).__name__, "message": str(exc)},
     )
 
 # -----------------------------
@@ -96,31 +118,42 @@ def rows_as_dicts(cur):
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 def market_exists(market_id: str) -> bool:
-    q = "SELECT 1 FROM markets WHERE market_id = %s LIMIT 1;"
+    q = """
+    SELECT 1
+    FROM (
+        SELECT market_id FROM core.markets WHERE market_id = %s
+        UNION
+        SELECT market_id FROM marts.market_day WHERE market_id = %s
+        UNION
+        SELECT market_id FROM public.market_integrity_score_daily WHERE market_id = %s
+    ) x
+    LIMIT 1;
+    """
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (market_id,))
+            cur.execute(q, (market_id, market_id, market_id))
             return cur.fetchone() is not None
 
 def _ensure_metrics_row(cur, market_id: str, day):
     """
-    Ensure market_metrics_daily has (market_id, day). If missing, clone the latest day.
-    Assumes market_metrics_daily has a UNIQUE constraint on (market_id, day).
+    Ensure marts.market_day has (market_id, day).
+    If missing, clone the latest day.
     """
     cur.execute(
         """
-        INSERT INTO market_metrics_daily (
+        INSERT INTO marts.market_day (
             market_id, day, volume, trades, unique_traders,
             spread_median, depth_2pct_median, concentration_hhi,
-            health_score, risk_score
+            health_score, risk_score, flags
         )
         SELECT
             market_id,
             %s AS day,
             volume, trades, unique_traders,
             spread_median, depth_2pct_median, concentration_hhi,
-            health_score, risk_score
-        FROM market_metrics_daily
+            health_score, risk_score,
+            COALESCE(flags, '[]'::jsonb) AS flags
+        FROM marts.market_day
         WHERE market_id = %s
         ORDER BY day DESC
         LIMIT 1
@@ -153,12 +186,11 @@ def _apply_action(cur, action_code: str, market_id: str, day, params: dict, dire
         health_delta = float(params.get("health_delta", 3))
         risk_delta = float(params.get("risk_delta", -2))
 
-        # spread improves when it goes DOWN. We store spread_median as decimal.
         spread_delta = -(spread_bps / 10000.0)
 
         cur.execute(
             """
-            UPDATE market_metrics_daily
+            UPDATE marts.market_day
             SET
                 spread_median = GREATEST(0, COALESCE(spread_median, 0) + (%s * %s)),
                 depth_2pct_median = GREATEST(0, COALESCE(depth_2pct_median, 0) + (%s * %s)),
@@ -179,6 +211,107 @@ def _apply_action(cur, action_code: str, market_id: str, day, params: dict, dire
                 day,
             ),
         )
+
+def build_coverage_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    timeline = snapshot.get("timeline") or []
+    incidents = snapshot.get("incidents") or []
+    interventions = snapshot.get("interventions") or []
+    overrides = snapshot.get("overrides") or []
+
+    traders = snapshot.get("traders") or {}
+    same_day = traders.get("same_day") or {}
+    rolling_window = traders.get("rolling_window") or {}
+
+    same_day_summary = same_day.get("summary") or []
+    same_day_cohort_summary = same_day.get("cohorts_summary") or []
+    same_day_trader_intelligence = same_day.get("intelligence") or []
+
+    rolling_summary = rolling_window.get("summary") or []
+    rolling_cohort_summary = rolling_window.get("cohorts_summary") or []
+    rolling_trader_intelligence = rolling_window.get("intelligence") or []
+
+    market = snapshot.get("market") or {}
+    errors = snapshot.get("errors") or []
+
+    has_timeline = len(timeline) > 0
+    has_integrity_history = has_timeline
+    has_impact = not any(e.get("key") == "impact" for e in errors)
+
+    has_same_day_trader_summary = len(same_day_summary) > 0
+    has_same_day_cohort_summary = len(same_day_cohort_summary) > 0
+    has_same_day_trader_intelligence = len(same_day_trader_intelligence) > 0
+
+    has_rolling_trader_summary = len(rolling_summary) > 0
+    has_rolling_cohort_summary = len(rolling_cohort_summary) > 0
+    has_rolling_trader_intelligence = len(rolling_trader_intelligence) > 0
+
+    has_trader_summary = has_same_day_trader_summary or has_rolling_trader_summary
+    has_cohort_summary = has_same_day_cohort_summary or has_rolling_cohort_summary
+    has_trader_intelligence = has_same_day_trader_intelligence or has_rolling_trader_intelligence
+
+    has_incidents = len(incidents) > 0
+    has_interventions = len(interventions) > 0
+    has_overrides = len(overrides) > 0
+
+    downstream_flags = [
+        bool(market.get("has_regime_data")),
+        bool(market.get("has_radar_data")),
+        bool(market.get("has_manipulation_data")),
+    ]
+    downstream_coverage_count = sum(1 for x in downstream_flags if x)
+
+    if (
+        has_timeline
+        and has_impact
+        and has_trader_summary
+        and has_cohort_summary
+        and has_trader_intelligence
+    ):
+        coverage_level = "full"
+    elif (
+        downstream_coverage_count >= 1
+        or has_timeline
+        or has_trader_summary
+        or has_cohort_summary
+        or has_trader_intelligence
+    ):
+        coverage_level = "partial"
+    else:
+        coverage_level = "sparse"
+
+    if coverage_level == "full":
+        coverage_reason = "Full downstream coverage available for this market."
+    elif market.get("is_partial_coverage") is True:
+        coverage_reason = "Live market with partial downstream coverage."
+    elif not has_timeline and not has_trader_summary and not has_impact:
+        coverage_reason = "Market exists, but downstream analytics are still sparse."
+    else:
+        coverage_reason = "Some downstream analytics are available, but coverage is incomplete."
+
+    return {
+        "has_timeline": has_timeline,
+        "has_integrity_history": has_integrity_history,
+        "has_impact": has_impact,
+
+        "has_trader_summary": has_trader_summary,
+        "has_cohort_summary": has_cohort_summary,
+        "has_trader_intelligence": has_trader_intelligence,
+
+        "has_same_day_trader_summary": has_same_day_trader_summary,
+        "has_same_day_cohort_summary": has_same_day_cohort_summary,
+        "has_same_day_trader_intelligence": has_same_day_trader_intelligence,
+
+        "has_rolling_trader_summary": has_rolling_trader_summary,
+        "has_rolling_cohort_summary": has_rolling_cohort_summary,
+        "has_rolling_trader_intelligence": has_rolling_trader_intelligence,
+
+        "has_incidents": has_incidents,
+        "has_interventions": has_interventions,
+        "has_overrides": has_overrides,
+        "coverage_level": coverage_level,
+        "coverage_reason": coverage_reason,
+        "downstream_coverage_count": downstream_coverage_count,
+    }
 
 # -----------------------------
 # Health
@@ -213,8 +346,9 @@ WITH latest_md AS (
     md.depth_2pct_median,
     md.concentration_hhi,
     md.health_score,
-    md.risk_score
-  FROM market_metrics_daily md
+    md.risk_score,
+    md.flags
+  FROM marts.market_day md
   ORDER BY md.market_id, md.day DESC
 ),
 base AS (
@@ -232,13 +366,15 @@ base AS (
     l.depth_2pct_median,
     l.concentration_hhi,
     COALESCE(mo.health_score_override, l.health_score) AS health_score,
-    COALESCE(mo.risk_score_override, l.risk_score) AS risk_score,
-    (mo.id IS NOT NULL) AS has_manual_override
-  FROM markets m
+    COALESCE(mo.risk_score_override,  l.risk_score)   AS risk_score,
+    (mo.id IS NOT NULL) AS has_manual_override,
+    COALESCE(l.flags, '[]'::jsonb) AS flags
+  FROM core.markets m
   JOIN latest_md l
     ON l.market_id = m.market_id
   LEFT JOIN market_manual_overrides mo
     ON mo.market_id = l.market_id AND mo.day = l.day
+  WHERE m.is_active = true
 )
 SELECT
   b.market_id,
@@ -256,25 +392,9 @@ SELECT
   b.health_score,
   b.risk_score,
   b.has_manual_override,
-  COALESCE(
-    jsonb_agg(
-      jsonb_build_object(
-        'flag_code', f.flag_code,
-        'severity', f.severity,
-        'details', f.details
-      )
-    ) FILTER (WHERE f.flag_code IS NOT NULL),
-    '[]'::jsonb
-  ) AS flags
+  b.flags
 FROM base b
-LEFT JOIN market_flags_daily f
-  ON f.market_id = b.market_id AND f.day = b.day
-GROUP BY
-  b.market_id, b.protocol, b.chain, b.title, b.category,
-  b.day, b.volume, b.trades, b.unique_traders,
-  b.spread_median, b.depth_2pct_median, b.concentration_hhi,
-  b.health_score, b.risk_score, b.has_manual_override
-ORDER BY b.risk_score DESC NULLS LAST;
+ORDER BY b.risk_score DESC NULLS LAST, b.volume DESC;
 """
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
@@ -309,28 +429,28 @@ def market_traders_summary(market_id: str, days: int = 30, top_n: int = 10):
     q = """
 WITH latest AS (
   SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
+  FROM public.trader_behavior_daily
   WHERE market_id = %s
 ),
 w AS (
   SELECT *
-  FROM trades
+  FROM public.trader_behavior_daily
   WHERE market_id = %s
     AND day >= (SELECT latest_day FROM latest) - %s
 )
 SELECT
   trader_id,
   COUNT(DISTINCT day)::int AS days_active,
-  COUNT(*)::int AS trades,
-  COALESCE(SUM(notional), 0)::float AS notional_total,
-  COALESCE(SUM(CASE WHEN UPPER(side)='BUY' THEN notional ELSE 0 END), 0)::float AS notional_buy,
-  COALESCE(SUM(CASE WHEN UPPER(side)='SELL' THEN notional ELSE 0 END), 0)::float AS notional_sell,
-  (COALESCE(SUM(notional), 0) / NULLIF(COUNT(*), 0))::float AS avg_trade_size,
-  MIN(ts)::text AS first_ts,
-  MAX(ts)::text AS last_ts
+  COALESCE(SUM(trades), 0)::int AS trades,
+  COALESCE(SUM(volume), 0)::float AS notional_total,
+  COALESCE(SUM(volume * buy_ratio), 0)::float AS notional_buy,
+  COALESCE(SUM(volume * (1 - buy_ratio)), 0)::float AS notional_sell,
+  (COALESCE(SUM(volume), 0) / NULLIF(COALESCE(SUM(trades), 0), 0))::float AS avg_trade_size,
+  MIN(first_trade_ts)::text AS first_ts,
+  MAX(last_trade_ts)::text AS last_ts
 FROM w
 GROUP BY trader_id
-ORDER BY notional_total DESC
+ORDER BY notional_total DESC, trades DESC
 LIMIT %s;
 """
     with psycopg.connect(get_db_dsn()) as conn:
@@ -347,80 +467,86 @@ class CohortSummaryRow(BaseModel):
     days_covered: int
 
 @app.get("/ops/markets/{market_id}/traders/cohorts/summary", response_model=List[CohortSummaryRow])
-def market_trader_cohorts_summary(market_id: str, days: int = 30):
+def market_trader_cohorts_summary(market_id: str, days: int = 1):
     days = max(1, min(int(days), 365))
 
     if not market_exists(market_id):
         raise HTTPException(
             status_code=404,
-            detail={"code": "market_not_found", "message": "Market not found", "details": {"market_id": market_id}},
+            detail={
+                "code": "market_not_found",
+                "message": "Market not found",
+                "details": {"market_id": market_id},
+            },
         )
 
     q = """
 WITH latest AS (
   SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
+  FROM public.trader_role_daily
   WHERE market_id = %s
 ),
 w AS (
   SELECT
-    ucd.market_id,
-    ucd.day,
-    ucd.trader_id,
-    ucd.cohort
-  FROM user_cohorts_daily ucd
-  WHERE ucd.market_id = %s
-    AND ucd.day >= (SELECT latest_day FROM latest) - %s
+    r.market_id,
+    r.day,
+    r.trader_id,
+    COALESCE(r.trades, 0) AS trades,
+    COALESCE(r.volume, 0) AS volume,
+    COALESCE(r.avg_trade_size, 0) AS avg_trade_size,
+    COALESCE(r.buy_ratio, 0.5) AS buy_ratio,
+    COALESCE(r.is_large_participant, false) AS is_large_participant,
+    COALESCE(r.is_one_sided, false) AS is_one_sided,
+    COALESCE(r.is_high_frequency, false) AS is_high_frequency
+  FROM public.trader_role_daily r
+  WHERE r.market_id = %s
+    AND r.day >= (SELECT latest_day FROM latest) - %s
+),
+normalized AS (
+  SELECT
+    CASE
+      WHEN is_high_frequency AND COALESCE(avg_trade_size, 0) <= 2 THEN 'POSSIBLE_FARMER'
+      WHEN is_large_participant THEN 'WHALE'
+      WHEN (
+        is_one_sided AND COALESCE(trades, 0) >= 2
+      ) OR (
+        ABS(COALESCE(buy_ratio, 0.5) - 0.5) >= 0.25 AND COALESCE(trades, 0) >= 2
+      ) THEN 'SPECULATOR'
+      ELSE 'NEUTRAL'
+    END AS cohort,
+    trader_id,
+    day,
+    trades,
+    volume,
+    avg_trade_size
+  FROM w
 ),
 agg AS (
   SELECT
-    w.cohort,
-    COUNT(DISTINCT w.trader_id)::int AS traders
-  FROM w
-  GROUP BY w.cohort
-),
-um AS (
-  SELECT
-    market_id,
-    trader_id,
-    SUM(trades_count)::int AS trades,
-    COALESCE(SUM(volume_notional), 0)::float AS notional_total,
-    (COALESCE(SUM(volume_notional), 0) / NULLIF(SUM(trades_count), 0))::float AS avg_trade_size
-  FROM user_market_daily
-  WHERE market_id = %s
-    AND day >= (SELECT latest_day FROM latest) - %s
-  GROUP BY market_id, trader_id
-),
-joined AS (
-  SELECT
-    w.cohort,
-    COALESCE(SUM(um.trades), 0)::int AS trades,
-    COALESCE(SUM(um.notional_total), 0)::float AS notional_total,
-    (COALESCE(SUM(um.notional_total), 0) / NULLIF(COALESCE(SUM(um.trades), 0), 0))::float AS avg_trade_size
-  FROM (SELECT DISTINCT cohort, trader_id FROM w) w
-  LEFT JOIN um
-    ON um.trader_id = w.trader_id
-  GROUP BY w.cohort
-),
-days_covered AS (
-  SELECT COUNT(DISTINCT day)::int AS days_covered
-  FROM w
+    cohort,
+    COUNT(DISTINCT trader_id)::int AS traders,
+    COALESCE(SUM(trades), 0)::int AS trades,
+    COALESCE(SUM(volume), 0)::float AS notional_total,
+    (
+      COALESCE(SUM(volume), 0) / NULLIF(COALESCE(SUM(trades), 0), 0)
+    )::float AS avg_trade_size,
+    COUNT(DISTINCT day)::int AS days_covered
+  FROM normalized
+  GROUP BY cohort
 )
 SELECT
-  a.cohort,
-  a.traders,
-  j.trades,
-  j.notional_total,
-  j.avg_trade_size,
-  (SELECT days_covered FROM days_covered) AS days_covered
-FROM agg a
-LEFT JOIN joined j
-  ON j.cohort = a.cohort
-ORDER BY j.notional_total DESC NULLS LAST, a.traders DESC;
+  cohort,
+  traders,
+  trades,
+  notional_total,
+  avg_trade_size,
+  days_covered
+FROM agg
+ORDER BY notional_total DESC NULLS LAST, traders DESC, cohort;
 """
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (market_id, market_id, days, market_id, days))
+            cur.execute(q, (market_id, market_id, days))
             return rows_as_dicts(cur)
 
 class TraderIntelligenceRow(BaseModel):
@@ -431,11 +557,12 @@ class TraderIntelligenceRow(BaseModel):
     avg_trade_size: float
     buy_ratio: float
     cohort: str
-    role_tag: str
+    operator_tag: str
     flags: Dict[str, Any] = {}
 
+
 @app.get("/ops/markets/{market_id}/traders/intelligence", response_model=List[TraderIntelligenceRow])
-def market_trader_intelligence(market_id: str, days: int = 30, top_n: int = 50):
+def market_trader_intelligence(market_id: str, days: int = 1, top_n: int = 50):
     days = max(1, min(int(days), 365))
     top_n = max(1, min(int(top_n), 500))
 
@@ -448,103 +575,107 @@ def market_trader_intelligence(market_id: str, days: int = 30, top_n: int = 50):
     q = """
 WITH latest AS (
   SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
+  FROM public.trader_behavior_daily
   WHERE market_id = %s
 ),
-um AS (
+behavior AS (
   SELECT
-    trader_id,
-    COUNT(DISTINCT day)::int AS days_active,
-    SUM(trades_count)::int AS trades,
-    COALESCE(SUM(volume_notional), 0)::float AS notional_total,
-    (COALESCE(SUM(volume_notional), 0) / NULLIF(SUM(trades_count), 0))::float AS avg_trade_size,
-    COALESCE(SUM(buy_count), 0)::int AS buy_count,
-    COALESCE(SUM(sell_count), 0)::int AS sell_count
-  FROM user_market_daily
-  WHERE market_id = %s
-    AND day >= (SELECT latest_day FROM latest) - %s
-  GROUP BY trader_id
-),
-last_cohort AS (
-  SELECT DISTINCT ON (trader_id)
-    trader_id,
-    cohort
-  FROM user_cohorts_daily
-  WHERE market_id = %s
-    AND day >= (SELECT latest_day FROM latest) - %s
-  ORDER BY trader_id, day DESC
-),
-base AS (
-  SELECT
-    um.*,
-    COALESCE(lc.cohort, 'UNKNOWN') AS cohort,
+    b.trader_id,
+    COUNT(DISTINCT b.day)::int AS days_active,
+    COALESCE(SUM(b.trades), 0)::int AS trades,
+    COALESCE(SUM(b.volume), 0)::float AS notional_total,
+    (COALESCE(SUM(b.volume), 0) / NULLIF(COALESCE(SUM(b.trades), 0), 0))::float AS avg_trade_size,
     CASE
-      WHEN (um.buy_count + um.sell_count) > 0
-        THEN (um.buy_count::float / (um.buy_count + um.sell_count))
+      WHEN COALESCE(SUM(b.trades), 0) > 0 AND COALESCE(SUM(b.volume), 0) > 0
+        THEN COALESCE(SUM(b.volume * b.buy_ratio), 0)::float / COALESCE(SUM(b.volume), 0)::float
       ELSE 0.5
-    END AS buy_ratio
-  FROM um
-  LEFT JOIN last_cohort lc
-    ON lc.trader_id = um.trader_id
+    END AS buy_ratio,
+    BOOL_OR(COALESCE(b.is_large_participant, false)) AS is_large_participant,
+    BOOL_OR(COALESCE(b.is_one_sided, false)) AS is_one_sided,
+    BOOL_OR(COALESCE(b.is_high_frequency, false)) AS is_high_frequency,
+    MAX(COALESCE(b.active_minutes, 0))::int AS active_minutes
+  FROM public.trader_behavior_daily b
+  WHERE b.market_id = %s
+    AND b.day >= (SELECT latest_day FROM latest) - %s
+  GROUP BY b.trader_id
 ),
 ranked AS (
-  SELECT *
-  FROM base
-  ORDER BY notional_total DESC
+  SELECT
+    b.trader_id,
+    b.days_active,
+    b.trades,
+    b.notional_total,
+    b.avg_trade_size,
+    b.buy_ratio,
+    b.is_large_participant,
+    b.is_one_sided,
+    b.is_high_frequency,
+    b.active_minutes
+  FROM behavior b
+  ORDER BY b.notional_total DESC, b.trades DESC
   LIMIT %s
 )
-SELECT
-  trader_id,
-  days_active,
-  trades,
-  notional_total,
-  avg_trade_size,
-  buy_ratio,
-  cohort
+SELECT *
 FROM ranked;
 """
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (market_id, market_id, days, market_id, days, top_n))
+            cur.execute(q, (market_id, market_id, days, top_n))
             rows = rows_as_dicts(cur)
 
-    out: List[dict] = []
+    out = []
     for r in rows:
         trades = int(r.get("trades") or 0)
         days_active = int(r.get("days_active") or 0)
         avg_size = float(r.get("avg_trade_size") or 0.0)
         buy_ratio = float(r.get("buy_ratio") or 0.5)
-        cohort = (r.get("cohort") or "UNKNOWN").upper()
 
         imbalance = abs(buy_ratio - 0.5)
-        high_freq = trades >= 200
-        balanced_flow = imbalance <= 0.12
-        very_small = avg_size <= 2.0
-        very_large = avg_size >= 25.0
+        is_large = bool(r.get("is_large_participant"))
+        is_one_sided = bool(r.get("is_one_sided"))
+        is_high_freq = bool(r.get("is_high_frequency"))
+        active_minutes = int(r.get("active_minutes") or 0)
 
-        role_tag = "RETAIL"
+        if is_high_freq and avg_size <= 2.0:
+            cohort = "POSSIBLE_FARMER"
+        elif is_large:
+            cohort = "WHALE"
+        elif (is_one_sided and trades >= 2) or (imbalance >= 0.25 and trades >= 2):
+            cohort = "SPECULATOR"
+        else:
+            cohort = "NEUTRAL"
+
+        operator_tag = "RETAIL"
         flags: Dict[str, Any] = {
-            "balanced_flow": balanced_flow,
+            "balanced_flow": imbalance <= 0.12,
             "imbalance": round(imbalance, 4),
+            "confidence": 0.0,
+            "supporting_flags": [],
+            "is_large_participant": is_large,
+            "is_one_sided": is_one_sided,
+            "is_high_frequency": is_high_freq,
+            "active_minutes": active_minutes,
+            "large_avg_trade_size": avg_size >= 25.0,
         }
 
-        if cohort == "FARMER" or (high_freq and very_small):
-            role_tag = "INCENTIVE_FARMER"
-            flags["reason"] = "high trade count with small average size"
-        elif cohort == "WHALE" or very_large:
-            role_tag = "WHALE"
-            flags["reason"] = "large average size or whale cohort"
-        elif days_active >= 10 and trades >= 80 and balanced_flow:
-            role_tag = "MAKER_LIKE"
-            flags["reason"] = "sustained activity with balanced buy sell flow"
-        elif trades >= 40 and imbalance >= 0.25:
-            role_tag = "DIRECTIONAL"
-            flags["reason"] = "persistent buy sell imbalance"
+        if is_high_freq and avg_size <= 2.0:
+            operator_tag = "INCENTIVE_FARMER"
+            flags["reason"] = "high frequency small size flow"
+        elif is_large:
+            operator_tag = "WHALE"
+            flags["reason"] = "large participation profile"
+        elif days_active >= 2 and imbalance <= 0.12:
+            operator_tag = "MAKER_LIKE"
+            flags["reason"] = "balanced participation across time"
+        elif (is_one_sided and trades >= 2) or (imbalance >= 0.25 and trades >= 2):
+            operator_tag = "DIRECTIONAL"
+            flags["reason"] = "repeated one sided speculative flow"
         elif trades >= 60:
-            role_tag = "ACTIVE_RETAIL"
-            flags["reason"] = "high activity without maker like balance"
+            operator_tag = "ACTIVE_RETAIL"
+            flags["reason"] = "high activity without stronger structural role"
         else:
-            role_tag = "RETAIL"
+            operator_tag = "RETAIL"
+            flags["reason"] = "general market participation"
 
         out.append(
             {
@@ -555,7 +686,7 @@ FROM ranked;
                 "avg_trade_size": avg_size,
                 "buy_ratio": buy_ratio,
                 "cohort": cohort,
-                "role_tag": role_tag,
+                "operator_tag": operator_tag,
                 "flags": flags,
             }
         )
@@ -563,7 +694,7 @@ FROM ranked;
     return out
 
 # -----------------------------
-# Market Quality & Cohort Impact (Institutional View)
+# Market Quality and Cohort Impact (Operational View)
 # -----------------------------
 from datetime import timedelta, date
 from decimal import Decimal
@@ -605,18 +736,41 @@ def _to_float(v) -> float:
 def _compute_cohort_share(cur, market_id: str, start_day, end_day) -> List[Dict[str, float]]:
     cur.execute(
         """
+        WITH behavior_window AS (
+            SELECT
+                b.trader_id,
+                b.day,
+                COALESCE(b.trades, 0)::int AS trades,
+                COALESCE(b.volume, 0)::double precision AS volume,
+                COALESCE(b.avg_trade_size, 0)::double precision AS avg_trade_size,
+                COALESCE(b.buy_ratio, 0.5)::double precision AS buy_ratio,
+                COALESCE(b.is_large_participant, false) AS is_large_participant,
+                COALESCE(b.is_one_sided, false) AS is_one_sided,
+                COALESCE(b.is_high_frequency, false) AS is_high_frequency
+            FROM public.trader_behavior_daily b
+            WHERE b.market_id = %s
+              AND b.day BETWEEN %s AND %s
+        ),
+        normalized AS (
+            SELECT
+                CASE
+                    WHEN is_high_frequency AND avg_trade_size <= 2 THEN 'POSSIBLE_FARMER'
+                    WHEN is_large_participant THEN 'WHALE'
+                    WHEN (is_one_sided AND trades >= 2)
+                      OR (ABS(buy_ratio - 0.5) >= 0.25 AND trades >= 2)
+                      THEN 'SPECULATOR'
+                    ELSE 'NEUTRAL'
+                END AS cohort,
+                volume,
+                trades
+            FROM behavior_window
+        )
         SELECT
-            c.cohort,
-            SUM(umd.volume_notional) AS notional_total,
-            SUM(umd.trades_count) AS trades
-        FROM user_market_daily umd
-        JOIN user_cohorts_daily c
-          ON c.market_id = umd.market_id
-         AND c.trader_id = umd.trader_id
-         AND c.day = umd.day
-        WHERE umd.market_id = %s
-          AND umd.day BETWEEN %s AND %s
-        GROUP BY c.cohort
+            cohort,
+            COALESCE(SUM(volume), 0) AS notional_total,
+            COALESCE(SUM(trades), 0) AS trades
+        FROM normalized
+        GROUP BY 1
         """,
         (market_id, start_day, end_day),
     )
@@ -667,6 +821,16 @@ def _compute_cohort_share_delta(
     out.sort(key=lambda x: (-abs(x["notional_share_delta"]), -abs(x["trade_share_delta"]), x["cohort"]))
     return out
 
+def _normalize_trader_role(role: Optional[str]) -> str:
+    r = (role or "").strip().lower()
+    if r == "whale":
+        return "WHALE"
+    if r in ("one_sided_speculator", "high_frequency_trader"):
+        return "SPECULATOR"
+    if r == "possible_farmer":
+        return "POSSIBLE_FARMER"
+    return "NEUTRAL"
+
 def _compute_cohort_risk_flags(
     recent_cohort_share: List[Dict[str, float]],
     cohort_share_delta: List[Dict[str, float]] | None = None,
@@ -677,31 +841,36 @@ def _compute_cohort_risk_flags(
     delta_map = {c["cohort"].upper(): c for c in (cohort_share_delta or [])}
 
     whale_notional = _to_float(recent_map.get("WHALE", {}).get("notional_share"))
-    casual_trade = _to_float(recent_map.get("CASUAL", {}).get("trade_share"))
-    active_trade = _to_float(recent_map.get("ACTIVE", {}).get("trade_share"))
+    spec_trade = _to_float(recent_map.get("SPECULATOR", {}).get("trade_share"))
+    neutral_trade = _to_float(recent_map.get("NEUTRAL", {}).get("trade_share"))
+    farmer_trade = _to_float(recent_map.get("POSSIBLE_FARMER", {}).get("trade_share"))
 
-    active_notional_delta = _to_float(delta_map.get("ACTIVE", {}).get("notional_share_delta"))
-    active_trade_delta = _to_float(delta_map.get("ACTIVE", {}).get("trade_share_delta"))
+    neutral_notional_delta = _to_float(delta_map.get("NEUTRAL", {}).get("notional_share_delta"))
+    neutral_trade_delta = _to_float(delta_map.get("NEUTRAL", {}).get("trade_share_delta"))
 
     if whale_notional >= 0.35:
         flags.append("WHALE_DOMINANCE_RISK")
 
-    if casual_trade >= 0.85:
-        flags.append("LOW_CONVICTION_FLOW")
+    if spec_trade >= 0.60:
+        flags.append("SPECULATIVE_FLOW_DOMINANCE")
 
-    if active_trade < 0.12 and whale_notional > 0.25:
-        flags.append("THIN_MIDDLE_LAYER")
+    if farmer_trade >= 0.20:
+        flags.append("INCENTIVE_DISTORTION_RISK")
 
-    if active_notional_delta <= -0.03 or active_trade_delta <= -0.015:
-        flags.append("MIDDLE_LAYER_EROSION")
+    if neutral_trade < 0.12 and whale_notional > 0.25:
+        flags.append("THIN_ORGANIC_LAYER")
 
-    if whale_notional < 0.10 and casual_trade > 0.75:
-        flags.append("NO_DEEP_LIQUIDITY_LAYER")
+    if neutral_notional_delta <= -0.03 or neutral_trade_delta <= -0.015:
+        flags.append("NEUTRAL_PARTICIPATION_EROSION")
+
+    if whale_notional < 0.10 and neutral_trade < 0.20:
+        flags.append("NO_DEEP_ORGANIC_LIQUIDITY")
 
     if not flags:
         flags.append("COHORT_STRUCTURE_STABLE")
 
     return flags
+
 
 def _compute_market_regime(delta: Dict[str, float]) -> str:
     spread = _to_float(delta.get("spread_median_delta"))
@@ -748,12 +917,6 @@ def market_trader_impact(
     days: int = Query(14, ge=4, le=60),
     anchor_day: Optional[date] = Query(None),
 ):
-    """
-    FIXED:
-      - The entire function body was accidentally indented under the 404 block before.
-        That caused the handler to return None for valid markets -> ResponseValidationError.
-      - This version always returns a dict that matches MarketImpactResponse OR raises HTTPException.
-    """
     days = max(4, min(int(days), 60))
 
     if not market_exists(market_id):
@@ -768,13 +931,10 @@ def market_trader_impact(
 
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            # -----------------------------------
-            # Anchor to latest metrics day
-            # -----------------------------------
             cur.execute(
                 """
                 SELECT MAX(day)
-                FROM market_metrics_daily
+                FROM marts.market_day
                 WHERE market_id = %s
                 """,
                 (market_id,),
@@ -802,9 +962,6 @@ def market_trader_impact(
             prior_end = recent_start - timedelta(days=1)
             prior_start = prior_end - timedelta(days=half - 1)
 
-            # -----------------------------------
-            # Recent window metrics
-            # -----------------------------------
             cur.execute(
                 """
                 SELECT
@@ -813,7 +970,7 @@ def market_trader_impact(
                     AVG(concentration_hhi),
                     AVG(unique_traders),
                     AVG(health_score)
-                FROM market_metrics_daily
+                FROM marts.market_day
                 WHERE market_id = %s
                   AND day BETWEEN %s AND %s
                 """,
@@ -821,9 +978,6 @@ def market_trader_impact(
             )
             recent = cur.fetchone() or (None, None, None, None, None)
 
-            # -----------------------------------
-            # Prior window metrics
-            # -----------------------------------
             cur.execute(
                 """
                 SELECT
@@ -832,7 +986,7 @@ def market_trader_impact(
                     AVG(concentration_hhi),
                     AVG(unique_traders),
                     AVG(health_score)
-                FROM market_metrics_daily
+                FROM marts.market_day
                 WHERE market_id = %s
                   AND day BETWEEN %s AND %s
                 """,
@@ -853,16 +1007,10 @@ def market_trader_impact(
                 "health_score_delta": safe_delta(recent[4], prior[4]),
             }
 
-            # -----------------------------------
-            # Cohort share (recent + prior) and delta
-            # -----------------------------------
             recent_cohort_share = _compute_cohort_share(cur, market_id, recent_start, max_day)
             prior_cohort_share = _compute_cohort_share(cur, market_id, prior_start, prior_end)
             cohort_share_delta = _compute_cohort_share_delta(recent_cohort_share, prior_cohort_share)
 
-            # -----------------------------------
-            # Institutional Diagnosis
-            # -----------------------------------
             diagnosis = "STABLE"
 
             if (
@@ -895,8 +1043,398 @@ def market_trader_impact(
                 "cohort_risk_flags": cohort_risk_flags,
             }
 
+
+class LaunchCandidateRow(BaseModel):
+    market_id: str
+    day: str
+    launch_readiness_score: float
+    launch_risk_score: float
+    participation_quality_score: float
+    liquidity_durability_score: float
+    concentration_penalty: float
+    speculative_flow_penalty: float
+    manipulation_penalty: float
+    recommendation: str
+    recommendation_reason: str
+    flags: List[str] = []
+    title: Optional[str] = None
+    category: Optional[str] = None
+    url: Optional[str] = None
+
+
+class LaunchCandidateDetailResponse(BaseModel):
+    market_id: str
+    day: str
+    launch_readiness_score: float
+    launch_risk_score: float
+    participation_quality_score: float
+    liquidity_durability_score: float
+    concentration_penalty: float
+    speculative_flow_penalty: float
+    manipulation_penalty: float
+    recommendation: str
+    recommendation_reason: str
+    flags: List[str] = []
+    title: Optional[str] = None
+    category: Optional[str] = None
+    url: Optional[str] = None
+    engine_version: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+class SocialIntelligenceRow(BaseModel):
+    market_id: str
+    day: str
+    attention_score: float
+    sentiment_score: float
+    demand_score: float
+    trend_velocity: float
+    mention_count: int
+    source_count: int
+    confidence_score: float
+    recommendation: str
+    summary: str
+    flags: List[str] = []
+    title: Optional[str] = None
+    category: Optional[str] = None
+    url: Optional[str] = None
+
+
+class SocialIntelligenceDetailResponse(BaseModel):
+    market_id: str
+    day: str
+    attention_score: float
+    sentiment_score: float
+    demand_score: float
+    trend_velocity: float
+    mention_count: int
+    source_count: int
+    confidence_score: float
+    recommendation: str
+    summary: str
+    flags: List[str] = []
+    title: Optional[str] = None
+    category: Optional[str] = None
+    url: Optional[str] = None
+    engine_version: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+@app.get("/ops/launch/candidates/{market_id}", response_model=LaunchCandidateDetailResponse)
+def ops_launch_candidate_detail(market_id: str):
+    return market_launch_intelligence(market_id)
+
+
+@app.get("/ops/launch/candidates", response_model=List[LaunchCandidateRow])
+def ops_launch_candidates(
+    recommendation: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    day: Optional[date] = Query(default=None),
+):
+    recommendation_normalized = (recommendation or "").strip().lower()
+
+    allowed = {"launch_ready", "monitor_then_launch", "not_ready"}
+    if recommendation_normalized and recommendation_normalized not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_recommendation",
+                "message": "Invalid recommendation filter",
+                "details": {"allowed": sorted(list(allowed))},
+            },
+        )
+
+    q = """
+    WITH latest_day AS (
+      SELECT COALESCE(%s::date, (SELECT MAX(day) FROM public.market_launch_intelligence_daily)) AS day
+    )
+    SELECT
+      li.market_id,
+      li.day::text AS day,
+      li.launch_readiness_score::float AS launch_readiness_score,
+      li.launch_risk_score::float AS launch_risk_score,
+      li.participation_quality_score::float AS participation_quality_score,
+      li.liquidity_durability_score::float AS liquidity_durability_score,
+      li.concentration_penalty::float AS concentration_penalty,
+      li.speculative_flow_penalty::float AS speculative_flow_penalty,
+      li.manipulation_penalty::float AS manipulation_penalty,
+      li.recommendation,
+      li.recommendation_reason,
+      COALESCE(li.flags, ARRAY[]::text[]) AS flags,
+      COALESCE(cm.title, i_latest.title, li.market_id) AS title,
+      COALESCE(cm.category, i_latest.category) AS category,
+      i_url.url AS url
+    FROM public.market_launch_intelligence_daily li
+    LEFT JOIN core.markets cm
+      ON cm.market_id = li.market_id
+    LEFT JOIN LATERAL (
+      SELECT
+        x.title,
+        x.category
+      FROM public.market_integrity_score_daily x
+      WHERE x.market_id = li.market_id
+      ORDER BY x.day DESC
+      LIMIT 1
+    ) i_latest ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        x.url
+      FROM public.market_integrity_score_daily x
+      WHERE x.market_id = li.market_id
+        AND x.url IS NOT NULL
+      ORDER BY x.day DESC
+      LIMIT 1
+    ) i_url ON TRUE
+    WHERE li.day = (SELECT day FROM latest_day)
+      AND (%s = '' OR li.recommendation = %s)
+    ORDER BY
+      li.launch_readiness_score DESC,
+      li.launch_risk_score ASC,
+      li.market_id ASC
+    LIMIT %s;
+    """
+
+    with psycopg.connect(get_db_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (day, recommendation_normalized, recommendation_normalized, limit))
+            return rows_as_dicts(cur)
+
+
+@app.get("/ops/markets/{market_id}/launch-intelligence", response_model=LaunchCandidateDetailResponse)
+def market_launch_intelligence(market_id: str):
+    if not market_exists(market_id):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "market_not_found",
+                "message": "Market not found",
+                "details": {"market_id": market_id},
+            },
+        )
+
+    q = """
+    SELECT
+      li.market_id,
+      li.day::text AS day,
+      li.launch_readiness_score::float AS launch_readiness_score,
+      li.launch_risk_score::float AS launch_risk_score,
+      li.participation_quality_score::float AS participation_quality_score,
+      li.liquidity_durability_score::float AS liquidity_durability_score,
+      li.concentration_penalty::float AS concentration_penalty,
+      li.speculative_flow_penalty::float AS speculative_flow_penalty,
+      li.manipulation_penalty::float AS manipulation_penalty,
+      li.recommendation,
+      li.recommendation_reason,
+      COALESCE(li.flags, ARRAY[]::text[]) AS flags,
+      COALESCE(cm.title, i_latest.title, li.market_id) AS title,
+      COALESCE(cm.category, i_latest.category) AS category,
+      i_url.url AS url,
+      li.engine_version,
+      li.created_at::text AS created_at,
+      li.updated_at::text AS updated_at
+    FROM public.market_launch_intelligence_daily li
+    LEFT JOIN core.markets cm
+      ON cm.market_id = li.market_id
+    LEFT JOIN LATERAL (
+      SELECT
+        x.title,
+        x.category
+      FROM public.market_integrity_score_daily x
+      WHERE x.market_id = li.market_id
+      ORDER BY x.day DESC
+      LIMIT 1
+    ) i_latest ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        x.url
+      FROM public.market_integrity_score_daily x
+      WHERE x.market_id = li.market_id
+        AND x.url IS NOT NULL
+      ORDER BY x.day DESC
+      LIMIT 1
+    ) i_url ON TRUE
+    WHERE li.market_id = %s
+    ORDER BY li.day DESC
+    LIMIT 1;
+    """
+
+    with psycopg.connect(get_db_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (market_id,))
+            row = cur.fetchone()
+
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "launch_intelligence_not_found",
+                        "message": "No launch intelligence found for market",
+                        "details": {"market_id": market_id},
+                    },
+                )
+
+            cols = [c.name for c in cur.description]
+            return dict(zip(cols, row))
+
+@app.get("/ops/social/markets/{market_id}", response_model=SocialIntelligenceDetailResponse)
+def market_social_intelligence(market_id: str):
+    if not market_exists(market_id):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "market_not_found",
+                "message": "Market not found",
+                "details": {"market_id": market_id},
+            },
+        )
+
+    q = """
+    SELECT
+      si.market_id,
+      si.day::text AS day,
+      si.attention_score::float AS attention_score,
+      si.sentiment_score::float AS sentiment_score,
+      si.demand_score::float AS demand_score,
+      si.trend_velocity::float AS trend_velocity,
+      COALESCE(si.mention_count, 0)::int AS mention_count,
+      COALESCE(si.source_count, 0)::int AS source_count,
+      si.confidence_score::float AS confidence_score,
+      si.recommendation,
+      si.summary,
+      COALESCE(si.flags, ARRAY[]::text[]) AS flags,
+      COALESCE(cm.title, i_latest.title, si.market_id) AS title,
+      COALESCE(cm.category, i_latest.category) AS category,
+      i_url.url AS url,
+      si.engine_version,
+      si.created_at::text AS created_at,
+      si.updated_at::text AS updated_at
+    FROM public.market_social_intelligence_daily si
+    LEFT JOIN core.markets cm
+      ON cm.market_id = si.market_id
+    LEFT JOIN LATERAL (
+      SELECT
+        x.title,
+        x.category
+      FROM public.market_integrity_score_daily x
+      WHERE x.market_id = si.market_id
+      ORDER BY x.day DESC
+      LIMIT 1
+    ) i_latest ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        x.url
+      FROM public.market_integrity_score_daily x
+      WHERE x.market_id = si.market_id
+        AND x.url IS NOT NULL
+      ORDER BY x.day DESC
+      LIMIT 1
+    ) i_url ON TRUE
+    WHERE si.market_id = %s
+    ORDER BY si.day DESC
+    LIMIT 1;
+    """
+
+    with psycopg.connect(get_db_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (market_id,))
+            row = cur.fetchone()
+
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "social_intelligence_not_found",
+                        "message": "No social intelligence found for market",
+                        "details": {"market_id": market_id},
+                    },
+                )
+
+            cols = [c.name for c in cur.description]
+            return dict(zip(cols, row))
+
+
+@app.get("/ops/social/candidates", response_model=List[SocialIntelligenceRow])
+def ops_social_candidates(
+    recommendation: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    day: Optional[date] = Query(default=None),
+):
+    recommendation_normalized = (recommendation or "").strip().lower()
+
+    allowed = {"rising", "watch", "weak"}
+    if recommendation_normalized and recommendation_normalized not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_recommendation",
+                "message": "Invalid recommendation filter",
+                "details": {"allowed": sorted(list(allowed))},
+            },
+        )
+
+    q = """
+    WITH latest_day AS (
+      SELECT COALESCE(%s::date, (SELECT MAX(day) FROM public.market_social_intelligence_daily)) AS day
+    )
+    SELECT
+      si.market_id,
+      si.day::text AS day,
+      si.attention_score::float AS attention_score,
+      si.sentiment_score::float AS sentiment_score,
+      si.demand_score::float AS demand_score,
+      si.trend_velocity::float AS trend_velocity,
+      COALESCE(si.mention_count, 0)::int AS mention_count,
+      COALESCE(si.source_count, 0)::int AS source_count,
+      si.confidence_score::float AS confidence_score,
+      si.recommendation,
+      si.summary,
+      COALESCE(si.flags, ARRAY[]::text[]) AS flags,
+      COALESCE(cm.title, i_latest.title, si.market_id) AS title,
+      COALESCE(cm.category, i_latest.category) AS category,
+      i_url.url AS url
+    FROM public.market_social_intelligence_daily si
+    LEFT JOIN core.markets cm
+      ON cm.market_id = si.market_id
+    LEFT JOIN LATERAL (
+      SELECT
+        x.title,
+        x.category
+      FROM public.market_integrity_score_daily x
+      WHERE x.market_id = si.market_id
+      ORDER BY x.day DESC
+      LIMIT 1
+    ) i_latest ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        x.url
+      FROM public.market_integrity_score_daily x
+      WHERE x.market_id = si.market_id
+        AND x.url IS NOT NULL
+      ORDER BY x.day DESC
+      LIMIT 1
+    ) i_url ON TRUE
+    WHERE si.day = (SELECT day FROM latest_day)
+      AND (%s = '' OR si.recommendation = %s)
+    ORDER BY
+      si.demand_score DESC,
+      si.attention_score DESC,
+      si.market_id ASC
+    LIMIT %s;
+    """
+
+    with psycopg.connect(get_db_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (day, recommendation_normalized, recommendation_normalized, limit))
+            return rows_as_dicts(cur)
+
+
+
 # -----------------------------
 # Single market (latest view)
+# Supports:
+# - full markets with core.markets + marts.market_day
+# - integrity-only live markets not yet present in core.markets
 # -----------------------------
 @app.get("/ops/markets/{market_id}")
 def ops_market(market_id: str):
@@ -912,35 +1450,129 @@ WITH latest_md AS (
     md.depth_2pct_median,
     md.concentration_hhi,
     md.health_score,
-    md.risk_score
-  FROM market_metrics_daily md
+    md.risk_score,
+    md.flags
+  FROM marts.market_day md
   WHERE md.market_id = %s
   ORDER BY md.day DESC
   LIMIT 1
 ),
+latest_integrity AS (
+  SELECT
+    i.market_id,
+    i.day,
+    i.title,
+    i.category,
+    i.regime,
+    i.regime_reason,
+    i.trades,
+    i.unique_traders,
+    i.market_quality_score,
+    i.liquidity_health_score,
+    i.concentration_risk_score,
+    i.whale_volume_share,
+    i.radar_risk_score,
+    i.manipulation_score,
+    i.manipulation_signal,
+    i.whale_role_share,
+    i.speculator_role_share,
+    i.neutral_role_share,
+    i.possible_farmer_count,
+    i.integrity_score,
+    i.integrity_band,
+    i.review_priority,
+    i.primary_reason,
+    i.needs_operator_review,
+    i.has_regime_data,
+    i.has_radar_data,
+    i.has_manipulation_data,
+    i.data_completeness_score,
+    i.is_partial_coverage
+  FROM public.market_integrity_score_daily i
+  WHERE i.market_id = %s
+  ORDER BY i.day DESC
+  LIMIT 1
+),
+latest_integrity_url AS (
+  SELECT
+    i.market_id,
+    i.url
+  FROM public.market_integrity_score_daily i
+  WHERE i.market_id = %s
+    AND i.url IS NOT NULL
+  ORDER BY i.day DESC
+  LIMIT 1
+),
+anchor AS (
+  SELECT
+    COALESCE(li.market_id, md.market_id) AS market_id,
+    GREATEST(
+      COALESCE(li.day, DATE '1900-01-01'),
+      COALESCE(md.day, DATE '1900-01-01')
+    ) AS day
+  FROM latest_integrity li
+  FULL OUTER JOIN latest_md md
+    ON li.market_id = md.market_id
+  LIMIT 1
+),
+
 base AS (
   SELECT
-    m.market_id,
-    m.protocol,
-    m.chain,
-    m.title,
-    m.category,
-    l.day,
-    l.volume,
-    l.trades,
-    l.unique_traders,
-    l.spread_median,
-    l.depth_2pct_median,
-    l.concentration_hhi,
-    COALESCE(mo.health_score_override, l.health_score) AS health_score,
-    COALESCE(mo.risk_score_override, l.risk_score) AS risk_score,
-    (mo.id IS NOT NULL) AS has_manual_override
-  FROM markets m
-  JOIN latest_md l
-    ON l.market_id = m.market_id
+    a.market_id,
+    COALESCE(m.protocol, 'polymarket') AS protocol,
+    COALESCE(m.chain, 'polygon') AS chain,
+    COALESCE(li.title, m.title, a.market_id) AS title,
+    COALESCE(li.category, m.category) AS category,
+    li_url.url AS url,
+    a.day,
+
+    md.volume,
+    COALESCE(md.trades, li.trades) AS trades,
+    COALESCE(md.unique_traders, li.unique_traders) AS unique_traders,
+
+    md.spread_median,
+    md.depth_2pct_median,
+    md.concentration_hhi,
+
+    COALESCE(mo.health_score_override, md.health_score) AS health_score,
+    COALESCE(mo.risk_score_override, md.risk_score) AS risk_score,
+    (mo.id IS NOT NULL) AS has_manual_override,
+    COALESCE(md.flags, '[]'::jsonb) AS flags,
+
+    li.regime,
+    li.regime_reason,
+    li.market_quality_score,
+    li.liquidity_health_score,
+    li.concentration_risk_score,
+    li.whale_volume_share,
+    li.radar_risk_score,
+    li.manipulation_score,
+    li.manipulation_signal,
+    li.whale_role_share,
+    li.speculator_role_share,
+    li.neutral_role_share,
+    li.possible_farmer_count,
+    li.integrity_score,
+    li.integrity_band,
+    li.review_priority,
+    li.primary_reason,
+    li.needs_operator_review,
+    li.has_regime_data,
+    li.has_radar_data,
+    li.has_manipulation_data,
+    li.data_completeness_score,
+    li.is_partial_coverage
+  FROM anchor a
+  LEFT JOIN core.markets m
+    ON m.market_id = a.market_id
+  LEFT JOIN latest_md md
+    ON md.market_id = a.market_id
+  LEFT JOIN latest_integrity li
+    ON li.market_id = a.market_id
+  LEFT JOIN latest_integrity_url li_url
+    ON li_url.market_id = a.market_id
   LEFT JOIN market_manual_overrides mo
-    ON mo.market_id = l.market_id AND mo.day = l.day
-  WHERE m.market_id = %s
+    ON mo.market_id = a.market_id AND mo.day = a.day
 )
 SELECT
   b.market_id,
@@ -948,6 +1580,7 @@ SELECT
   b.chain,
   b.title,
   b.category,
+  b.url,
   b.day,
   b.volume,
   b.trades,
@@ -958,41 +1591,46 @@ SELECT
   b.health_score,
   b.risk_score,
   b.has_manual_override,
-  COALESCE(
-    jsonb_agg(
-      jsonb_build_object(
-        'flag_code', f.flag_code,
-        'severity', f.severity,
-        'details', f.details
-      )
-    ) FILTER (WHERE f.flag_code IS NOT NULL),
-    '[]'::jsonb
-  ) AS flags
+  b.flags,
+  b.regime,
+  b.regime_reason,
+  b.market_quality_score,
+  b.liquidity_health_score,
+  b.concentration_risk_score,
+  b.whale_volume_share,
+  b.radar_risk_score,
+  b.manipulation_score,
+  b.manipulation_signal,
+  b.whale_role_share,
+  b.speculator_role_share,
+  b.neutral_role_share,
+  b.possible_farmer_count,
+  b.integrity_score,
+  b.integrity_band,
+  b.review_priority,
+  b.primary_reason,
+  b.needs_operator_review,
+  b.has_regime_data,
+  b.has_radar_data,
+  b.has_manipulation_data,
+  b.data_completeness_score,
+  b.is_partial_coverage
 FROM base b
-LEFT JOIN market_flags_daily f
-  ON f.market_id = b.market_id AND f.day = b.day
-GROUP BY
-  b.market_id, b.protocol, b.chain, b.title, b.category,
-  b.day, b.volume, b.trades, b.unique_traders,
-  b.spread_median, b.depth_2pct_median, b.concentration_hhi,
-  b.health_score, b.risk_score, b.has_manual_override
 LIMIT 1;
 """
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (market_id, market_id))
+            cur.execute(q, (market_id, market_id, market_id))
             row = cur.fetchone()
+
             if not row:
-                cur.execute("SELECT 1 FROM markets WHERE market_id = %s LIMIT 1;", (market_id,))
-                exists = cur.fetchone()
-                if exists:
-                    raise HTTPException(
-                        status_code=404,
-                        detail={"code": "no_metrics", "message": "Market has no metrics yet", "details": {"market_id": market_id}},
-                    )
                 raise HTTPException(
                     status_code=404,
-                    detail={"code": "market_not_found", "message": "Market not found", "details": {"market_id": market_id}},
+                    detail={
+                        "code": "market_not_found",
+                        "message": "Market not found in analytics tables",
+                        "details": {"market_id": market_id},
+                    },
                 )
 
             cols = [c.name for c in cur.description]
@@ -1004,90 +1642,139 @@ LIMIT 1;
 # after = incident day + after_days, capped at latest_day
 # -----------------------------
 @app.get("/ops/markets/{market_id}/incidents/effectiveness")
-def incident_effectiveness(market_id: str, days: int = 30, after_days: int = 3):
-    days = max(1, min(int(days), 90))
+def incident_effectiveness(market_id: str, days: int = 30, after_days: int = 3, **_ignored):
+    days = max(1, min(int(days), 180))
     after_days = max(0, min(int(after_days), 30))
 
     q = """
 WITH latest AS (
-  SELECT market_id, MAX(day) AS latest_day
+  SELECT COALESCE(MAX(day), CURRENT_DATE) AS latest_day
   FROM market_metrics_daily
   WHERE market_id = %s
-  GROUP BY market_id
 ),
 inc AS (
-  SELECT id, market_id, day, status, note, created_by, created_at
-  FROM market_incidents
-  WHERE market_id = %s
-    AND day >= (SELECT latest_day FROM latest) - %s
+  SELECT
+    i.id AS incident_id,
+    i.market_id,
+    i.day::date AS incident_day,
+    i.status,
+    i.note,
+    i.created_by,
+    i.created_at
+  FROM market_incidents i
+  WHERE i.market_id = %s
+    AND i.day >= (SELECT latest_day FROM latest) - %s
 ),
-inc2 AS (
+base AS (
   SELECT
     inc.*,
-    l.latest_day,
-    (inc.day - INTERVAL '1 day')::date AS before_day,
-    LEAST(
-      l.latest_day,
-      (inc.day + (%s * INTERVAL '1 day'))::date
-    ) AS after_day
+    (inc.incident_day - INTERVAL '1 day')::date AS before_day,
+    inc.incident_day AS after_day
   FROM inc
-  JOIN latest l ON l.market_id = inc.market_id
+),
+joined AS (
+  SELECT
+    base.*,
+
+    mb.trades AS b_trades,
+    mb.volume AS b_volume,
+    mb.risk_score AS b_risk,
+    mb.health_score AS b_health,
+    mb.spread_median AS b_spread,
+    mb.unique_traders AS b_unique,
+    mb.concentration_hhi AS b_hhi,
+    mb.depth_2pct_median AS b_depth,
+
+    ma.trades AS a_trades,
+    ma.volume AS a_volume,
+    ma.risk_score AS a_risk,
+    ma.health_score AS a_health,
+    ma.spread_median AS a_spread,
+    ma.unique_traders AS a_unique,
+    ma.concentration_hhi AS a_hhi,
+    ma.depth_2pct_median AS a_depth
+
+  FROM base
+  LEFT JOIN market_metrics_daily mb
+    ON mb.market_id = base.market_id AND mb.day = base.before_day
+  LEFT JOIN market_metrics_daily ma
+    ON ma.market_id = base.market_id AND ma.day = base.after_day
+),
+scored AS (
+  SELECT
+    j.*,
+
+    (j.a_trades - j.b_trades) AS d_trades,
+    (j.a_volume - j.b_volume) AS d_volume,
+    (j.a_risk - j.b_risk) AS d_risk,
+    (j.a_health - j.b_health) AS d_health,
+    (j.a_spread - j.b_spread) AS d_spread,
+    (j.a_unique - j.b_unique) AS d_unique,
+    (j.a_hhi - j.b_hhi) AS d_hhi,
+    (j.a_depth - j.b_depth) AS d_depth,
+
+    (
+      COALESCE((j.b_risk - j.a_risk), 0) * 1.0 +
+      COALESCE((j.a_health - j.b_health), 0) * 1.0 +
+      COALESCE((j.b_spread - j.a_spread), 0) * 100.0 +
+      COALESCE((j.a_depth - j.b_depth) / 100.0, 0) * 1.0
+    ) AS delta_score
+
+  FROM joined j
 )
 SELECT
-  inc2.id,
-  inc2.market_id,
-  inc2.day,
-  inc2.status,
-  inc2.note,
-  inc2.created_by,
-  inc2.created_at,
-  inc2.before_day,
-  inc2.after_day,
+  scored.incident_id,
+  scored.market_id,
+  scored.incident_day AS day,
+  scored.status,
+  scored.note,
+  scored.created_by,
+  scored.created_at,
+
+  scored.before_day,
+  scored.after_day,
 
   jsonb_build_object(
-    'trades', b.trades,
-    'volume', b.volume,
-    'risk_score', b.risk_score,
-    'health_score', b.health_score,
-    'spread_median', b.spread_median,
-    'unique_traders', b.unique_traders,
-    'concentration_hhi', b.concentration_hhi,
-    'depth_2pct_median', b.depth_2pct_median
+    'trades', scored.b_trades,
+    'volume', scored.b_volume,
+    'risk_score', scored.b_risk,
+    'health_score', scored.b_health,
+    'spread_median', scored.b_spread,
+    'unique_traders', scored.b_unique,
+    'concentration_hhi', scored.b_hhi,
+    'depth_2pct_median', scored.b_depth
   ) AS before,
 
   jsonb_build_object(
-    'trades', a.trades,
-    'volume', a.volume,
-    'risk_score', a.risk_score,
-    'health_score', a.health_score,
-    'spread_median', a.spread_median,
-    'unique_traders', a.unique_traders,
-    'concentration_hhi', a.concentration_hhi,
-    'depth_2pct_median', a.depth_2pct_median
+    'trades', scored.a_trades,
+    'volume', scored.a_volume,
+    'risk_score', scored.a_risk,
+    'health_score', scored.a_health,
+    'spread_median', scored.a_spread,
+    'unique_traders', scored.a_unique,
+    'concentration_hhi', scored.a_hhi,
+    'depth_2pct_median', scored.a_depth
   ) AS after,
 
   jsonb_build_object(
-    'trades', (a.trades - b.trades),
-    'volume', (a.volume - b.volume),
-    'risk_score', (a.risk_score - b.risk_score),
-    'health_score', (a.health_score - b.health_score),
-    'spread_median', (a.spread_median - b.spread_median),
-    'unique_traders', (a.unique_traders - b.unique_traders),
-    'concentration_hhi', (a.concentration_hhi - b.concentration_hhi),
-    'depth_2pct_median', (a.depth_2pct_median - b.depth_2pct_median)
-  ) AS delta
+    'trades', scored.d_trades,
+    'volume', scored.d_volume,
+    'risk_score', scored.d_risk,
+    'health_score', scored.d_health,
+    'spread_median', scored.d_spread,
+    'unique_traders', scored.d_unique,
+    'concentration_hhi', scored.d_hhi,
+    'depth_2pct_median', scored.d_depth
+  ) AS delta,
 
-FROM inc2
-LEFT JOIN market_metrics_daily b
-  ON b.market_id = inc2.market_id AND b.day = inc2.before_day
-LEFT JOIN market_metrics_daily a
-  ON a.market_id = inc2.market_id AND a.day = inc2.after_day
-ORDER BY inc2.day DESC, inc2.created_at DESC;
+  scored.delta_score
+FROM scored
+ORDER BY scored.incident_day DESC, scored.created_at DESC, scored.incident_id DESC;
 """
 
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (market_id, market_id, days, after_days))
+            cur.execute(q, (market_id, market_id, days))
             return rows_as_dicts(cur)
 
 # -----------------------------
@@ -1100,23 +1787,21 @@ def ops_market_snapshot(
     lookback_days: int = 30,
     impact_days: int = 14,
 ):
-    """
-    One payload for the market page.
-    Guarded: if one sub query fails, snapshot still returns with errors[] populated.
-    """
-
     timeline_days = max(1, min(int(timeline_days), 60))
     lookback_days = max(1, min(int(lookback_days), 180))
     impact_days = max(4, min(int(impact_days), 60))
 
-    # Effectiveness windows (UI contract)
     INCIDENT_EFFECT_DAYS = 30
     INCIDENT_AFTER_DAYS = 3
 
     if not market_exists(market_id):
         raise HTTPException(
             status_code=404,
-            detail={"code": "market_not_found", "message": "Market not found", "details": {"market_id": market_id}},
+            detail={
+                "code": "market_not_found",
+                "message": "Market not found",
+                "details": {"market_id": market_id},
+            },
         )
 
     errors: List[Dict[str, Any]] = []
@@ -1166,7 +1851,6 @@ def ops_market_snapshot(
         [],
     )
 
-    # IMPORTANT: snapshot must use after_days for incident effectiveness
     incident_effectiveness_rows = safe_call(
         "incident_effectiveness",
         lambda: incident_effectiveness(
@@ -1209,6 +1893,21 @@ def ops_market_snapshot(
         [],
     )
 
+    launch_intelligence = safe_call(
+        "launch_intelligence",
+        lambda: market_launch_intelligence(market_id),
+        {},
+    )
+
+    social_intelligence = safe_call(
+        "social_intelligence",
+        lambda: market_social_intelligence(market_id),
+        {},
+    )
+
+    # -----------------------------
+    # Rolling trader context
+    # -----------------------------
     traders_summary = safe_call(
         "traders_summary",
         lambda: market_traders_summary(market_id, days=lookback_days, top_n=10),
@@ -1224,6 +1923,27 @@ def ops_market_snapshot(
     trader_intelligence = safe_call(
         "trader_intelligence",
         lambda: market_trader_intelligence(market_id, days=lookback_days, top_n=50),
+        [],
+    )
+
+    # -----------------------------
+    # Same day trader context
+    # -----------------------------
+    same_day_traders_summary = safe_call(
+        "same_day_traders_summary",
+        lambda: market_traders_summary(market_id, days=1, top_n=10),
+        [],
+    )
+
+    same_day_cohorts_summary = safe_call(
+        "same_day_cohorts_summary",
+        lambda: market_trader_cohorts_summary(market_id, days=1),
+        [],
+    )
+
+    same_day_trader_intelligence = safe_call(
+        "same_day_trader_intelligence",
+        lambda: market_trader_intelligence(market_id, days=1, top_n=50),
         [],
     )
 
@@ -1250,17 +1970,125 @@ def ops_market_snapshot(
         },
     )
 
-    # -----------------------------
-    # UI meta for delta heat display
-    # Frontend uses this to color cells consistently.
-    # -----------------------------
+    recent_cohort_share = (impact or {}).get("recent_cohort_share") or []
+    recent_share_map = {
+        (row.get("cohort") or "").upper(): row
+        for row in recent_cohort_share
+    }
+
+    opportunity_summary = {
+        "structural_state": None,
+        "launch_state": None,
+        "social_state": None,
+        "summary": "No combined opportunity view available.",
+        "alignment": "unknown",
+        "signals": [],
+    }
+
+    if market:
+        structural_state = (
+            (market.get("integrity_band") or market.get("regime") or "unknown")
+            if isinstance(market, dict)
+            else "unknown"
+        )
+        launch_state = (
+            (launch_intelligence.get("recommendation") or "unknown")
+            if isinstance(launch_intelligence, dict) and launch_intelligence
+            else "unknown"
+        )
+        social_state = (
+            (social_intelligence.get("recommendation") or "unknown")
+            if isinstance(social_intelligence, dict) and social_intelligence
+            else "unknown"
+        )
+
+        signals = []
+
+        if (market.get("needs_operator_review") is True):
+            signals.append("operator_review_needed")
+
+        if isinstance(market.get("structural_divergence"), dict):
+            if market["structural_divergence"].get("has_divergence") is True:
+                signals.append("structural_divergence_present")
+
+        if launch_state == "launch_ready":
+            signals.append("launch_ready")
+        elif launch_state == "monitor_then_launch":
+            signals.append("monitor_before_launch")
+        elif launch_state == "not_ready":
+            signals.append("not_launch_ready")
+
+        if social_state == "rising":
+            signals.append("social_demand_rising")
+        elif social_state == "watch":
+            signals.append("social_demand_watch")
+        elif social_state == "cold":
+            signals.append("social_demand_cold")
+
+        alignment = "mixed"
+        summary = "Structural and demand signals are mixed."
+
+        if launch_state == "launch_ready" and social_state == "rising":
+            alignment = "strong"
+            summary = "Strong structural quality and rising demand signals."
+        elif launch_state == "monitor_then_launch" and social_state == "rising":
+            alignment = "developing"
+            summary = "Demand is improving, but structure still needs monitoring."
+        elif launch_state == "launch_ready" and social_state in {"watch", "cold"}:
+            alignment = "structural_only"
+            summary = "Structure looks ready, but demand confirmation is weaker."
+        elif launch_state == "not_ready":
+            alignment = "weak"
+            summary = "Structural quality is not ready for launch regardless of current demand."
+        elif launch_state == "monitor_then_launch" and social_state == "watch":
+            alignment = "mixed"
+            summary = "Market is structurally promising but still needs more confirmation."
+        elif launch_state == "unknown" and social_state != "unknown":
+            alignment = "partial"
+            summary = "Demand signal is available, but launch signal is missing."
+        elif launch_state != "unknown" and social_state == "unknown":
+            alignment = "partial"
+            summary = "Launch signal is available, but demand signal is missing."
+
+        opportunity_summary = {
+            "structural_state": structural_state,
+            "launch_state": launch_state,
+            "social_state": social_state,
+            "summary": summary,
+            "alignment": alignment,
+            "signals": signals,
+        }
+
+    if market:
+        market["recent_whale_notional_share"] = float(
+            (recent_share_map.get("WHALE") or {}).get("notional_share") or 0.0
+        )
+        market["recent_speculator_notional_share"] = float(
+            (recent_share_map.get("SPECULATOR") or {}).get("notional_share") or 0.0
+        )
+        market["recent_neutral_notional_share"] = float(
+            (recent_share_map.get("NEUTRAL") or {}).get("notional_share") or 0.0
+        )
+
+        market["recent_whale_trade_share"] = float(
+            (recent_share_map.get("WHALE") or {}).get("trade_share") or 0.0
+        )
+        market["recent_speculator_trade_share"] = float(
+            (recent_share_map.get("SPECULATOR") or {}).get("trade_share") or 0.0
+        )
+        market["recent_neutral_trade_share"] = float(
+            (recent_share_map.get("NEUTRAL") or {}).get("trade_share") or 0.0
+        )
+
+        market["role_share_interpretation"] = {
+            "latest_day": "Same day role shares from market integrity and radar.",
+            "recent_window": "Rolling cohort shares derived from the impact window.",
+        }
+
     interventions_effectiveness_ui = {
         "heat": {
-            # good when value goes up
             "good_up": ["health_score", "depth_2pct_median", "unique_traders", "volume", "trades"],
-            # good when value goes down
             "good_down": ["risk_score", "spread_median", "concentration_hhi"],
-            # suggested step sizes for intensity bucketing
             "steps": {
                 "risk_score": 1.0,
                 "health_score": 1.0,
@@ -1273,7 +2101,6 @@ def ops_market_snapshot(
                 "delta_score": 2.0,
                 "roi_score": 0.25,
             },
-            # suggested decimals for display
             "precision": {
                 "risk_score": 0,
                 "health_score": 0,
@@ -1289,8 +2116,97 @@ def ops_market_snapshot(
         }
     }
 
-    return {
-        "market": market or {},
+    anchor_day = (market or {}).get("day")
+
+    if market:
+        latest_whale_share = float((market or {}).get("whale_role_share") or 0.0)
+        latest_speculator_share = float((market or {}).get("speculator_role_share") or 0.0)
+        latest_neutral_share = float((market or {}).get("neutral_role_share") or 0.0)
+
+        recent_whale_share = float((market or {}).get("recent_whale_notional_share") or 0.0)
+        recent_speculator_share = float((market or {}).get("recent_speculator_notional_share") or 0.0)
+        recent_neutral_share = float((market or {}).get("recent_neutral_notional_share") or 0.0)
+
+        divergence_flags: List[str] = []
+
+        if (
+            (latest_whale_share <= 0.05 and recent_whale_share >= 0.15)
+            or (latest_speculator_share <= 0.05 and recent_speculator_share >= 0.15)
+            or ((latest_neutral_share - recent_neutral_share) >= 0.20)
+        ):
+            divergence_flags.append("LATEST_DAY_VS_RECENT_WINDOW_DIVERGENCE")
+
+        if latest_whale_share <= 0.05 and recent_whale_share >= 0.15:
+            divergence_flags.append("RECENT_WHALE_PARTICIPATION_PRESENT")
+
+        if latest_speculator_share <= 0.05 and recent_speculator_share >= 0.15:
+            divergence_flags.append("RECENT_SPECULATIVE_FLOW_PRESENT")
+
+        if (latest_neutral_share - recent_neutral_share) >= 0.20:
+            divergence_flags.append("NEUTRAL_SHARE_WEAKER_IN_RECENT_WINDOW")
+
+        if divergence_flags:
+            divergence_summary_parts: List[str] = []
+
+            if "RECENT_WHALE_PARTICIPATION_PRESENT" in divergence_flags:
+                divergence_summary_parts.append("recent whale participation is meaningful")
+
+            if "RECENT_SPECULATIVE_FLOW_PRESENT" in divergence_flags:
+                divergence_summary_parts.append("recent speculative flow is meaningful")
+
+            if "NEUTRAL_SHARE_WEAKER_IN_RECENT_WINDOW" in divergence_flags:
+                divergence_summary_parts.append("recent neutral participation is weaker than the latest day view")
+
+            market["structural_divergence"] = {
+                "has_divergence": True,
+                "flags": divergence_flags,
+                "summary": (
+                    "Latest day appears more neutral than the recent window. "
+                    + "; ".join(divergence_summary_parts)
+                    + "."
+                ),
+                "latest_day": {
+                    "whale_role_share": latest_whale_share,
+                    "speculator_role_share": latest_speculator_share,
+                    "neutral_role_share": latest_neutral_share,
+                },
+                "recent_window": {
+                    "whale_notional_share": recent_whale_share,
+                    "speculator_notional_share": recent_speculator_share,
+                    "neutral_notional_share": recent_neutral_share,
+                },
+            }
+        else:
+            market["structural_divergence"] = {
+                "has_divergence": False,
+                "flags": [],
+                "summary": "Latest day structure is broadly consistent with the recent window.",
+                "latest_day": {
+                    "whale_role_share": latest_whale_share,
+                    "speculator_role_share": latest_speculator_share,
+                    "neutral_role_share": latest_neutral_share,
+                },
+                "recent_window": {
+                    "whale_notional_share": recent_whale_share,
+                    "speculator_notional_share": recent_speculator_share,
+                    "neutral_notional_share": recent_neutral_share,
+                },
+            }
+
+    snapshot = {
+        "market": {
+            **(market or {}),
+            "horizon": "latest_day",
+        },
+        "launch_intelligence": {
+            **(launch_intelligence or {}),
+            "horizon": "latest_day",
+        } if launch_intelligence else {},
+        "social_intelligence": {
+            **(social_intelligence or {}),
+            "horizon": "latest_day",
+        } if social_intelligence else {},
+        "opportunity_summary": opportunity_summary,
         "timeline": timeline or [],
         "incidents": incidents or [],
         "incident_events": incident_events or [],
@@ -1301,13 +2217,56 @@ def ops_market_snapshot(
         "intervention_cumulative": interventions_cumulative_row or {},
         "overrides": overrides or [],
         "traders": {
-            "summary": traders_summary or [],
-            "cohorts_summary": cohorts_summary or [],
-            "intelligence": trader_intelligence or [],
+            "same_day": {
+                "horizon": "same_day",
+                "anchor_day": anchor_day,
+                "summary": same_day_traders_summary or [],
+                "cohorts_summary": same_day_cohorts_summary or [],
+                "intelligence": same_day_trader_intelligence or [],
+            },
+            "rolling_window": {
+                "horizon": f"last_{lookback_days}_days",
+                "anchor_day": anchor_day,
+                "summary": traders_summary or [],
+                "cohorts_summary": cohorts_summary or [],
+                "intelligence": trader_intelligence or [],
+            },
         },
-        "impact": impact or {},
+        "impact": {
+            **(impact or {}),
+            "horizon": f"last_{impact_days}_days",
+        },
         "errors": errors,
+        "snapshot_meta": {
+            "market_horizon": "latest_day",
+            "launch_horizon": "latest_day",
+            "social_horizon": "latest_day",
+            "traders_horizon": {
+                "same_day": "same_day",
+                "rolling_window": f"last_{lookback_days}_days",
+            },
+            "impact_horizon": f"last_{impact_days}_days",
+            "interpretation": {
+                "market": "Latest available daily state for this market.",
+                "launch_intelligence": "Latest structural launch recommendation for this market.",
+                "social_intelligence": "Latest demand and attention signal for this market.",
+                "opportunity_summary": "Combined structural and demand interpretation for launch decision support.",
+                "traders": {
+                    "same_day": "Participant context for the latest market day only.",
+                    "rolling_window": "Recent participant context aggregated over the trader lookback window.",
+                },
+                "impact": "Recent trend context comparing the recent and prior windows.",
+            },
+        },
     }
+
+    snapshot["coverage_summary"] = build_coverage_summary(snapshot)
+
+    snapshot["coverage_summary"]["has_launch_intelligence"] = bool(snapshot.get("launch_intelligence"))
+    snapshot["coverage_summary"]["has_social_intelligence"] = bool(snapshot.get("social_intelligence"))
+    snapshot["coverage_summary"]["has_opportunity_summary"] = bool(snapshot.get("opportunity_summary"))
+
+    return snapshot
 
 # -----------------------------
 # Timeline (anchored to latest day)
@@ -1318,7 +2277,7 @@ def market_timeline(market_id: str, days: int = 14):
     q = """
 WITH latest AS (
   SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
+  FROM marts.market_day
   WHERE market_id = %s
 )
 SELECT
@@ -1331,7 +2290,7 @@ SELECT
   concentration_hhi,
   health_score,
   risk_score
-FROM market_metrics_daily
+FROM marts.market_day
 WHERE market_id = %s
   AND day >= (SELECT latest_day FROM latest) - %s
 ORDER BY day ASC;
@@ -1346,6 +2305,7 @@ ORDER BY day ASC;
 # -----------------------------
 from datetime import datetime, timezone
 import random
+import hashlib
 
 class SeedTradesRequest(BaseModel):
     days: int = 30
@@ -1356,7 +2316,7 @@ class SeedTradesRequest(BaseModel):
     seed: int = 42
 
 @app.post("/dev/seed_trades")
-def dev_seed_trades(payload: SeedTradesRequest, operator: str = Depends(require_write_key)):
+def dev_seed_trades(payload: SeedTradesRequest, operator: AuthUser = Depends(require_operator)):
     days = max(1, min(int(payload.days), 90))
     markets_n = max(1, min(int(payload.markets), 25))
     traders_n = max(5, min(int(payload.traders), 500))
@@ -1366,24 +2326,29 @@ def dev_seed_trades(payload: SeedTradesRequest, operator: str = Depends(require_
     rng = random.Random(int(payload.seed))
 
     q_markets = """
-SELECT DISTINCT market_id
-FROM market_metrics_daily
+SELECT market_id
+FROM core.markets
+WHERE is_active = true
 ORDER BY market_id
 LIMIT %s;
 """
 
     q_latest = """
 SELECT MAX(day) AS latest_day
-FROM market_metrics_daily;
+FROM marts.market_day;
 """
 
     q_insert = """
-INSERT INTO trades (market_id, day, ts, trader_id, side, price, size, notional, source)
-VALUES (%s, %s::date, %s::timestamptz, %s, %s, %s, %s, %s, 'seed');
+INSERT INTO core.trades (
+  trade_id, market_id, trader_id, side, price, size, notional, ts, day, source
+)
+VALUES (
+  %s, %s, %s, %s, %s, %s, %s, %s::timestamptz, %s::date, 'seed'
+);
 """
 
     q_clear_window = """
-DELETE FROM trades
+DELETE FROM core.trades
 WHERE source = 'seed'
   AND day >= %s::date
   AND day <= %s::date;
@@ -1407,7 +2372,7 @@ SELECT
   SUM(CASE WHEN side='SELL' THEN 1 ELSE 0 END)::int AS sell_count,
   MIN(ts) AS first_ts,
   MAX(ts) AS last_ts
-FROM trades
+FROM core.trades
 WHERE day >= %s::date AND day <= %s::date
 GROUP BY market_id, day, trader_id
 ON CONFLICT (market_id, day, trader_id)
@@ -1469,7 +2434,7 @@ DO UPDATE SET cohort = EXCLUDED.cohort, score = EXCLUDED.score;
             cur.execute(q_latest)
             latest_day = cur.fetchone()[0]
             if not latest_day:
-                raise HTTPException(status_code=400, detail={"code": "no_market_days", "message": "market_metrics_daily has no rows"})
+                raise HTTPException(status_code=400, detail={"code": "no_market_days", "message": "marts.market_day has no rows"})
 
             cur.execute(q_markets, (markets_n,))
             market_ids = [r[0] for r in cur.fetchall()]
@@ -1484,6 +2449,16 @@ DO UPDATE SET cohort = EXCLUDED.cohort, score = EXCLUDED.score;
             cur.execute(q_clear_user_cohorts_daily, (start_day, end_day))
 
             trader_ids = [f"t{n:04d}" for n in range(1, traders_n + 1)]
+
+            # Ensure traders exist (FK on core.trades.trader_id)
+            cur.execute(
+                """
+                INSERT INTO core.traders (trader_id)
+                SELECT UNNEST(%s::text[])
+                ON CONFLICT (trader_id) DO NOTHING;
+                """,
+                (trader_ids,),
+            )
 
             total = 0
             for d in range(days):
@@ -1506,7 +2481,8 @@ DO UPDATE SET cohort = EXCLUDED.cohort, score = EXCLUDED.score;
                         seconds = rng.randint(0, 86399)
                         ts = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(seconds=seconds)
 
-                        cur.execute(q_insert, (mid, day, ts, trader, side, price, size, notional))
+                        trade_id = hashlib.md5(f"seed:{mid}:{trader}:{ts.isoformat()}:{side}:{price:.6f}:{size:.6f}".encode()).hexdigest()
+                        cur.execute(q_insert, (trade_id, mid, trader, side, price, size, notional, ts, day))
                         total += 1
 
             cur.execute(q_build_user_market_daily, (start_day, end_day))
@@ -1531,15 +2507,11 @@ class IncidentCreate(BaseModel):
     note: str
     created_by: str = "operator"
 
+
 @app.get("/ops/markets/{market_id}/incidents")
 def market_incidents(market_id: str, days: int = 14):
-    days = max(1, min(int(days), 60))
+    days = max(1, min(int(days), 180))
     q = """
-WITH latest AS (
-  SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
-  WHERE market_id = %s
-)
 SELECT
   id,
   market_id,
@@ -1550,27 +2522,42 @@ SELECT
   created_at
 FROM market_incidents
 WHERE market_id = %s
-  AND day >= (SELECT latest_day FROM latest) - %s
-ORDER BY day DESC, created_at DESC;
+ORDER BY created_at DESC, id DESC
+LIMIT %s;
 """
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (market_id, market_id, days))
+            cur.execute(q, (market_id, days))
             return rows_as_dicts(cur)
 
+
 @app.post("/ops/markets/{market_id}/incidents")
-def create_incident(market_id: str, payload: IncidentCreate, operator: str = Depends(require_write_key)):
+def create_incident(
+    market_id: str,
+    payload: IncidentCreate,
+    operator: AuthUser = Depends(require_operator),
+):
+    created_by = operator.email
+
     if not market_exists(market_id):
         raise HTTPException(
             status_code=404,
-            detail={"code": "market_not_found", "message": "Market not found", "details": {"market_id": market_id}},
+            detail={
+                "code": "market_not_found",
+                "message": "Market not found",
+                "details": {"market_id": market_id},
+            },
         )
 
     status = (payload.status or "OPEN").strip().upper()
     if status not in {"OPEN", "MONITOR", "RESOLVED"}:
         raise HTTPException(
             status_code=400,
-            detail={"code": "invalid_status", "message": "Invalid status", "details": {"allowed": ["OPEN", "MONITOR", "RESOLVED"]}},
+            detail={
+                "code": "invalid_status",
+                "message": "Invalid status",
+                "details": {"allowed": ["OPEN", "MONITOR", "RESOLVED"]},
+            },
         )
 
     q_incident = """
@@ -1596,7 +2583,7 @@ VALUES (%s, %s, %s::date, %s, %s, %s, %s, %s, %s);
 
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q_incident, (market_id, payload.day, status, payload.note, operator))
+            cur.execute(q_incident, (market_id, payload.day, status, payload.note, created_by))
             row = cur.fetchone()
             cols = [c.name for c in cur.description]
             incident = dict(zip(cols, row))
@@ -1611,7 +2598,7 @@ VALUES (%s, %s, %s::date, %s, %s, %s, %s, %s, %s);
                     None,
                     incident["status"],
                     (incident.get("note") or "").strip() or None,
-                    operator,
+                    created_by,
                     incident["created_at"],
                 ),
             )
@@ -1627,15 +2614,11 @@ class IncidentStatusUpdate(BaseModel):
     note: str | None = None
     created_by: str | None = None
 
+
 @app.get("/ops/markets/{market_id}/incident_events")
 def market_incident_events(market_id: str, days: int = 30):
-    days = max(1, min(int(days), 120))
+    days = max(1, min(int(days), 500))
     q = """
-WITH latest AS (
-  SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
-  WHERE market_id = %s
-)
 SELECT
   id,
   incident_id,
@@ -1649,25 +2632,32 @@ SELECT
   created_at
 FROM market_incident_events
 WHERE market_id = %s
-  AND day >= (SELECT latest_day FROM latest) - %s
-ORDER BY created_at DESC, id DESC;
+ORDER BY created_at DESC, id DESC
+LIMIT %s;
 """
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (market_id, market_id, days))
+            cur.execute(q, (market_id, days))
             return rows_as_dicts(cur)
+
 
 @app.post("/ops/incidents/{incident_id}/status")
 def update_incident_status(
     incident_id: int,
     payload: IncidentStatusUpdate,
-    operator: str = Depends(require_write_key),
+    operator: AuthUser = Depends(require_operator),
 ):
+    created_by = operator.email
+
     desired = (payload.status or "").strip().upper()
     if desired not in {"OPEN", "MONITOR", "RESOLVED"}:
         raise HTTPException(
             status_code=400,
-            detail={"code": "invalid_status", "message": "Invalid status", "details": {"allowed": ["OPEN", "MONITOR", "RESOLVED"]}},
+            detail={
+                "code": "invalid_status",
+                "message": "Invalid status",
+                "details": {"allowed": ["OPEN", "MONITOR", "RESOLVED"]},
+            },
         )
 
     q_get = """
@@ -1703,7 +2693,11 @@ RETURNING id;
             if not existing:
                 raise HTTPException(
                     status_code=404,
-                    detail={"code": "incident_not_found", "message": "Incident not found", "details": {"id": incident_id}},
+                    detail={
+                        "code": "incident_not_found",
+                        "message": "Incident not found",
+                        "details": {"id": incident_id},
+                    },
                 )
 
             cols = [c.name for c in cur.description]
@@ -1728,7 +2722,7 @@ RETURNING id;
                     from_status,
                     desired,
                     (payload.note or "").strip() or None,
-                    operator,
+                    created_by,
                 ),
             )
 
@@ -1748,9 +2742,12 @@ def interventions_effectiveness(market_id: str, days: int = 60):
 
     q = """
 WITH latest AS (
-  SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
-  WHERE market_id = %s
+  SELECT COALESCE(
+    (SELECT MAX(COALESCE(applied_at::date, day)) FROM market_interventions WHERE market_id = %s),
+    (SELECT MAX(day) FROM market_incidents WHERE market_id = %s),
+    (SELECT MAX(day) FROM market_metrics_daily WHERE market_id = %s),
+    (SELECT MAX(day) FROM marts.market_day WHERE market_id = %s)
+  ) AS latest_day
 ),
 itv_raw AS (
   SELECT
@@ -1769,7 +2766,10 @@ itv_raw AS (
   FROM market_interventions
   WHERE market_id = %s
     AND status = 'APPLIED'
-    AND COALESCE(applied_at::date, day) >= (SELECT latest_day FROM latest) - %s
+    AND (
+      (SELECT latest_day FROM latest) IS NULL
+      OR COALESCE(applied_at::date, day) >= (SELECT latest_day FROM latest) - %s
+    )
 ),
 itv_grp AS (
   SELECT
@@ -1782,7 +2782,6 @@ itv_grp AS (
     MIN(created_at) AS first_created_at,
     MAX(created_at) AS last_created_at,
 
-    -- keep representative fields from latest row
     (ARRAY_AGG(id ORDER BY created_at DESC))[1] AS id,
     (ARRAY_AGG(incident_id ORDER BY created_at DESC))[1] AS incident_id,
     (ARRAY_AGG(day ORDER BY created_at DESC))[1] AS day,
@@ -1804,7 +2803,7 @@ base AS (
 ),
 joined AS (
   SELECT
-    base.*,
+    b.*,
 
     mb.trades AS b_trades,
     mb.volume AS b_volume,
@@ -1824,17 +2823,16 @@ joined AS (
     ma.concentration_hhi AS a_hhi,
     ma.depth_2pct_median AS a_depth
 
-  FROM base
+  FROM base b
   LEFT JOIN market_metrics_daily mb
-    ON mb.market_id = base.market_id AND mb.day = base.before_day
+    ON mb.market_id = b.market_id AND mb.day = b.before_day
   LEFT JOIN market_metrics_daily ma
-    ON ma.market_id = base.market_id AND ma.day = base.after_day
+    ON ma.market_id = b.market_id AND ma.day = b.after_day
 ),
 scored AS (
   SELECT
     j.*,
 
-    -- deltas
     (j.a_trades - j.b_trades) AS d_trades,
     (j.a_volume - j.b_volume) AS d_volume,
     (j.a_risk - j.b_risk) AS d_risk,
@@ -1844,8 +2842,6 @@ scored AS (
     (j.a_hhi - j.b_hhi) AS d_hhi,
     (j.a_depth - j.b_depth) AS d_depth,
 
-    -- Delta score: positive is "good"
-    -- Risk down good, Health up good, Spread down good, Depth up good
     (
       COALESCE((j.b_risk - j.a_risk), 0) * 1.0 +
       COALESCE((j.a_health - j.b_health), 0) * 1.0 +
@@ -1853,9 +2849,6 @@ scored AS (
       COALESCE((j.a_depth - j.b_depth) / 100.0, 0) * 1.0
     ) AS delta_score,
 
-    -- Cost proxy from params:
-    -- 1) budget if present
-    -- 2) otherwise action_count as tiny cost proxy (prevents div by zero)
     GREATEST(
       COALESCE((j.params->>'budget')::numeric, 1000 * j.action_count),
       1
@@ -1919,7 +2912,6 @@ SELECT
 
   scored.delta_score,
 
-  -- ROI score: delta_score per 1000 budget (or cost proxy)
   CASE
     WHEN scored.cost_proxy IS NULL OR scored.cost_proxy = 0 THEN NULL
     ELSE (scored.delta_score / (scored.cost_proxy / 1000.0))
@@ -1931,7 +2923,7 @@ ORDER BY scored.applied_day DESC, scored.last_created_at DESC;
 
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (market_id, market_id, days))
+            cur.execute(q, (market_id, market_id, market_id, market_id, market_id, days))
             return rows_as_dicts(cur)
 
 
@@ -1950,15 +2942,14 @@ class InterventionCreate(BaseModel):
 
 @app.get("/ops/markets/{market_id}/interventions")
 def list_interventions(market_id: str, days: int = 30):
-    """
-    Raw audit trail.
-    """
     days = max(1, min(int(days), 180))
     q = """
 WITH latest AS (
-  SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
-  WHERE market_id = %s
+  SELECT COALESCE(
+    (SELECT MAX(day) FROM market_interventions WHERE market_id = %s),
+    (SELECT MAX(day) FROM market_incidents WHERE market_id = %s),
+    (SELECT MAX(day) FROM marts.market_day WHERE market_id = %s)
+  ) AS latest_day
 )
 SELECT
   id,
@@ -1974,33 +2965,36 @@ SELECT
   applied_at
 FROM market_interventions
 WHERE market_id = %s
-  AND day >= (SELECT latest_day FROM latest) - %s
+  AND (
+    (SELECT latest_day FROM latest) IS NULL
+    OR day >= (SELECT latest_day FROM latest) - %s
+  )
 ORDER BY day DESC, created_at DESC;
 """
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (market_id, market_id, days))
+            cur.execute(q, (market_id, market_id, market_id, market_id, days))
             return rows_as_dicts(cur)
 
 
 def list_interventions_collapsed(market_id: str, days: int = 30):
-    """
-    UI friendly list.
-    Collapses by (market_id, day, action_code).
-    Adds: action_count, first_created_at, last_created_at.
-    """
     days = max(1, min(int(days), 180))
     q = """
 WITH latest AS (
-  SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
-  WHERE market_id = %s
+  SELECT COALESCE(
+    (SELECT MAX(day) FROM market_interventions WHERE market_id = %s),
+    (SELECT MAX(day) FROM market_incidents WHERE market_id = %s),
+    (SELECT MAX(day) FROM marts.market_day WHERE market_id = %s)
+  ) AS latest_day
 ),
 base AS (
   SELECT *
   FROM market_interventions
   WHERE market_id = %s
-    AND day >= (SELECT latest_day FROM latest) - %s
+    AND (
+      (SELECT latest_day FROM latest) IS NULL
+      OR day >= (SELECT latest_day FROM latest) - %s
+    )
 )
 SELECT
   market_id,
@@ -2010,7 +3004,6 @@ SELECT
   MIN(created_at) AS first_created_at,
   MAX(created_at) AS last_created_at,
 
-  -- representative fields from latest row
   (ARRAY_AGG(id ORDER BY created_at DESC))[1] AS id,
   (ARRAY_AGG(incident_id ORDER BY created_at DESC))[1] AS incident_id,
   (ARRAY_AGG(title ORDER BY created_at DESC))[1] AS title,
@@ -2025,7 +3018,7 @@ ORDER BY day DESC, last_created_at DESC;
 """
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (market_id, market_id, days))
+            cur.execute(q, (market_id, market_id, market_id, market_id, days))
             return rows_as_dicts(cur)
 
 
@@ -2034,8 +3027,41 @@ def interventions_collapsed(market_id: str, days: int = 30):
     return list_interventions_collapsed(market_id, days=days)
 
 
+# -----------------------------
+# Params normalization (prevents band_bps vs spread_bps mismatches)
+# -----------------------------
+def normalize_params(action_code: str, params: dict | None) -> dict:
+    params = params or {}
+
+    if action_code == "LIQUIDITY_BOOST":
+        # backwards compat: old UI used band_bps
+        if "spread_bps" not in params and "band_bps" in params:
+            params["spread_bps"] = params.pop("band_bps")
+
+        # hard defaults so apply/revert always has the full set
+        params.setdefault("spread_bps", 10)
+        params.setdefault("depth_delta", 500)
+        params.setdefault("health_delta", 3)
+        params.setdefault("risk_delta", -2)
+
+        # optional but useful for ROI
+        if "budget" in params:
+            try:
+                params["budget"] = float(params["budget"])
+            except Exception:
+                params["budget"] = 1000.0
+
+    return params
+
+
 @app.post("/ops/markets/{market_id}/interventions")
-def create_intervention(market_id: str, payload: InterventionCreate, operator: str = Depends(require_write_key)):
+def create_intervention(
+    market_id: str,
+    payload: InterventionCreate,
+    operator: AuthUser = Depends(require_operator),
+):
+    created_by = operator.email
+
     if not market_exists(market_id):
         raise HTTPException(
             status_code=404,
@@ -2046,8 +3072,14 @@ def create_intervention(market_id: str, payload: InterventionCreate, operator: s
     if status not in {"PLANNED", "APPLIED", "REVERTED", "CANCELLED"}:
         raise HTTPException(
             status_code=400,
-            detail={"code": "invalid_status", "message": "Invalid status", "details": {"allowed": ["PLANNED", "APPLIED", "REVERTED", "CANCELLED"]}},
+            detail={
+                "code": "invalid_status",
+                "message": "Invalid status",
+                "details": {"allowed": ["PLANNED", "APPLIED", "REVERTED", "CANCELLED"]},
+            },
         )
+
+    norm_params = normalize_params((payload.action_code or "").strip().upper(), payload.params)
 
     q = """
 INSERT INTO market_interventions
@@ -2066,11 +3098,11 @@ RETURNING
                     market_id,
                     payload.incident_id,
                     payload.day,
-                    payload.action_code,
-                    payload.title,
+                    (payload.action_code or "").strip().upper(),
+                    (payload.title or "").strip(),
                     status,
-                    Json(payload.params),
-                    operator,
+                    Json(norm_params),
+                    created_by,
                     status,
                 ),
             )
@@ -2078,10 +3110,10 @@ RETURNING
             conn.commit()
             cols = [c.name for c in cur.description]
             return dict(zip(cols, row))
-
-
+        
 @app.post("/ops/interventions/{intervention_id}/apply")
-def apply_intervention(intervention_id: int, operator: str = Depends(require_write_key)):
+def apply_intervention(intervention_id: int, operator: AuthUser = Depends(require_operator)):
+    created_by = operator.email
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -2108,7 +3140,7 @@ def apply_intervention(intervention_id: int, operator: str = Depends(require_wri
             market_id = itv["market_id"]
             day = itv["day"]
             action_code = itv["action_code"]
-            params = _parse_params(itv.get("params"))
+            params = normalize_params(action_code, _parse_params(itv.get("params")))
 
             cur.execute(
                 """
@@ -2119,7 +3151,7 @@ def apply_intervention(intervention_id: int, operator: str = Depends(require_wri
                 WHERE id = %s
                 RETURNING id, market_id, incident_id, day, action_code, title, status, params, created_by, created_at, applied_at
                 """,
-                (operator, intervention_id),
+                (created_by, intervention_id),
             )
             updated_row = cur.fetchone()
             updated_cols = [c.name for c in cur.description]
@@ -2131,9 +3163,229 @@ def apply_intervention(intervention_id: int, operator: str = Depends(require_wri
             conn.commit()
             return updated
 
+@app.post("/ops/admin/ingest/polymarket/markets")
+def admin_ingest_polymarket_markets(
+    limit: int = 200,
+    offset: int = 0,
+    operator: AuthUser = Depends(require_operator),
+):
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+    return ingest_polymarket_markets(limit=limit, offset=offset)
+
+from datetime import date as _date
+from fastapi import Query
+from datetime import datetime, timezone
+
+def _parse_ts(v: str | None) -> datetime | None:
+    if not v:
+        return None
+    s = v.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+@app.post("/ops/admin/ingest/polymarket/bbo_ws_one")
+def admin_ingest_polymarket_bbo_ws_one(
+    market_id: str = Query(...),
+    max_events: int = Query(300, ge=10, le=2000),
+    user=Depends(require_operator),
+):
+    return ingest_polymarket_bbo_ws_for_market(
+        market_id=market_id,
+        max_events=max_events,
+    )
+
+@app.post("/ops/admin/compute/trader_behavior_daily")
+def admin_compute_trader_behavior_daily(
+    day: Optional[date] = Query(default=None),
+    limit_markets: int = Query(default=500, ge=1, le=5000),
+    market_id: Optional[str] = Query(default=None),
+):
+    return compute_trader_behavior_daily(
+        day=day,
+        limit_markets=limit_markets,
+        market_id=market_id,
+    )
+
+
+@app.post("/ops/admin/compute/trader_role_daily")
+def admin_compute_trader_role_daily(
+    day: Optional[date] = Query(default=None),
+    limit_markets: int = Query(default=500, ge=1, le=5000),
+    market_id: Optional[str] = Query(default=None),
+):
+    return compute_trader_role_daily(
+        day=day,
+        limit_markets=limit_markets,
+        market_id=market_id,
+    )
+
+
+@app.post("/ops/admin/compute/microstructure")
+def admin_compute_microstructure(
+    day: Optional[_date] = None,
+    window_hours: int = Query(24, ge=1, le=168),
+    limit_markets: int = Query(500, ge=1, le=5000),
+):
+    return compute_microstructure_daily(day=day, window_hours=window_hours, limit_markets=limit_markets)
+
+@app.post("/ops/admin/compute/traders_daily")
+def admin_compute_traders_daily(
+    day: Optional[date] = Query(default=None),
+    window_hours: int = Query(default=24, ge=1, le=168),
+):
+    return compute_trader_daily_stats(day=day, window_hours=window_hours)
+
+
+@app.post("/ops/admin/compute/trader_labels_daily")
+def admin_compute_trader_labels_daily(
+    day: Optional[date] = Query(default=None),
+    whale_volume_threshold: float = Query(default=1000.0, ge=0),
+    farmer_markets_threshold: int = Query(default=10, ge=1),
+):
+    return compute_trader_labels_daily(
+        day=day,
+        whale_volume_threshold=whale_volume_threshold,
+        farmer_markets_threshold=farmer_markets_threshold,
+    )
+
+@app.post("/ops/admin/compute/market_risk_radar")
+def admin_compute_market_risk_radar_daily(
+    day: Optional[date] = Query(default=None),
+    limit_markets: int = Query(default=500, ge=1, le=5000),
+    operator: AuthUser = Depends(require_operator),
+):
+    return compute_market_risk_radar_daily(
+        day=day,
+        limit_markets=limit_markets,
+    )
+
+
+@app.post("/ops/admin/compute/market_integrity")
+def admin_compute_market_integrity_daily(
+    day: Optional[date] = Query(default=None),
+    limit_markets: int = Query(default=500, ge=1, le=5000),
+    operator: AuthUser = Depends(require_operator),
+):
+    return compute_market_integrity_daily(
+        day=day,
+        limit_markets=limit_markets,
+    )
+
+@app.post("/ops/admin/compute/market_manipulation")
+def admin_compute_market_manipulation(
+    day: Optional[date] = None,
+    limit_markets: int = 500,
+):
+    return compute_market_manipulation_daily(day=day, limit_markets=limit_markets)
+
+@app.post("/ops/admin/compute/market_launch_intelligence")
+def admin_compute_market_launch_intelligence(
+    day: Optional[date] = Query(default=None),
+    limit_markets: int = Query(default=500, ge=1, le=5000),
+    operator: AuthUser = Depends(require_operator),
+):
+    return compute_market_launch_intelligence_daily(
+        day=day,
+        limit_markets=limit_markets,
+    )
+
+@app.post("/ops/admin/compute/market_social_intelligence")
+def admin_compute_market_social_intelligence(
+    day: Optional[date] = Query(default=None),
+    limit_markets: int = Query(default=500, ge=1, le=5000),
+    operator: AuthUser = Depends(require_operator),
+):
+    return compute_market_social_intelligence_daily(
+        day=day,
+        limit_markets=limit_markets,
+    )
+
+@app.post("/ops/admin/compute/market_regime_v2")
+def admin_compute_market_regime_v2(
+    day: Optional[date] = Query(default=None),
+    limit_markets: int = Query(default=5000, ge=1, le=20000),
+    user: AuthUser = Depends(require_operator),
+):
+    try:
+        result = compute_market_regime_daily_v2(
+            day=day,
+            limit_markets=limit_markets,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "code": "internal_error",
+                    "message": "Internal server error",
+                    "details": {
+                        "type": type(e).__name__,
+                        "message": str(e),
+                    },
+                }
+            },
+        )
+
+
+@app.post("/ops/admin/ingest/polymarket/metrics_daily")
+def admin_ingest_polymarket_metrics_daily(
+    limit: int = Query(200, ge=1, le=500),
+    user=Depends(require_operator),
+):
+    return ingest_polymarket_metrics_daily(limit=limit)
+
+@app.post("/ops/admin/ingest/polymarket/trades_rest")
+def admin_ingest_polymarket_trades_rest(
+    lookback_hours: int = Query(72, ge=1, le=720),
+    use_cursor: bool = Query(True),
+    operator: AuthUser = Depends(require_operator),
+):
+    return ingest_polymarket_trades_rest_job(
+        lookback_hours=lookback_hours,
+        use_cursor=use_cursor,
+    )
+
+@app.post("/ops/admin/ingest/polymarket/trades_rest_one")
+def admin_ingest_polymarket_trades_rest_one(
+    market_id: str,
+    lookback_hours: int = Query(240, ge=1, le=720),
+    operator: AuthUser = Depends(require_operator),
+):
+    return ingest_polymarket_trades_rest_for_market_job(
+        market_id=market_id,
+        lookback_hours=lookback_hours,
+    )
+
+@app.post("/ops/admin/ingest/polymarket/trades_ws")
+def admin_ingest_polymarket_trades_ws(
+    limit_markets: int = Query(50, ge=1, le=200),
+    max_events: int = Query(300, ge=10, le=2000),
+    user=Depends(require_operator),
+):
+    return ingest_polymarket_trades_ws(
+        limit_markets=limit_markets,
+        max_events=max_events,
+    )
+
+@app.post("/ops/admin/ingest/polymarket/trades_rest_one")
+def admin_ingest_polymarket_trades_rest_one(
+    market_id: str,
+    lookback_hours: int = Query(240, ge=1, le=720),
+    operator: AuthUser = Depends(require_operator),
+):
+    return ingest_polymarket_trades_rest_for_market(
+        market_id=market_id,
+        lookback_hours=lookback_hours,
+    )
 
 @app.post("/ops/interventions/{intervention_id}/revert")
-def revert_intervention(intervention_id: int, operator: str = Depends(require_write_key)):
+def revert_intervention(intervention_id: int, operator: AuthUser = Depends(require_operator)):
+    created_by = operator.email
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -2167,7 +3419,7 @@ def revert_intervention(intervention_id: int, operator: str = Depends(require_wr
             market_id = itv["market_id"]
             day = itv["day"]
             action_code = itv["action_code"]
-            params = _parse_params(itv.get("params"))
+            params = normalize_params(action_code, _parse_params(itv.get("params")))
 
             _ensure_metrics_row(cur, market_id, day)
             _apply_action(cur, action_code, market_id, day, params, direction=-1)
@@ -2190,7 +3442,8 @@ def revert_intervention(intervention_id: int, operator: str = Depends(require_wr
 
 
 @app.post("/ops/interventions/{intervention_id}/cancel")
-def cancel_intervention(intervention_id: int, operator: str = Depends(require_write_key)):
+def cancel_intervention(intervention_id: int, operator: AuthUser = Depends(require_operator)):
+    created_by = operator.email
     with psycopg.connect(get_db_dsn()) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -2269,7 +3522,7 @@ def interventions_cumulative(market_id: str, days: int = 30):
     q = """
 WITH latest AS (
   SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
+  FROM marts.market_day
   WHERE market_id = %s
 ),
 itv AS (
@@ -2306,9 +3559,9 @@ joined AS (
     mb.depth_2pct_median AS b_depth,
     ma.depth_2pct_median AS a_depth
   FROM base
-  LEFT JOIN market_metrics_daily mb
+  LEFT JOIN marts.market_day mb
     ON mb.market_id = base.market_id AND mb.day = base.before_day
-  LEFT JOIN market_metrics_daily ma
+  LEFT JOIN marts.market_day ma
     ON ma.market_id = base.market_id AND ma.day = base.after_day
 )
 SELECT
@@ -2344,7 +3597,7 @@ FROM joined;
                 "spread_median": _to_float_local(out.get("spread_median")),
                 "depth_2pct_median": _to_float_local(out.get("depth_2pct_median")),
             }
-
+        
 # -----------------------------
 # Manual overrides
 # -----------------------------
@@ -2355,13 +3608,14 @@ class ManualOverrideCreate(BaseModel):
     note: Optional[str] = None
     created_by: str = "operator"
 
+
 @app.get("/ops/markets/{market_id}/overrides")
 def list_overrides(market_id: str, days: int = 30):
     days = max(1, min(int(days), 180))
     q = """
 WITH latest AS (
   SELECT MAX(day) AS latest_day
-  FROM market_metrics_daily
+  FROM marts.market_day
   WHERE market_id = %s
 )
 SELECT
@@ -2382,8 +3636,10 @@ ORDER BY day DESC, created_at DESC;
             cur.execute(q, (market_id, market_id, days))
             return rows_as_dicts(cur)
 
+
 @app.post("/ops/markets/{market_id}/overrides")
-def upsert_override(market_id: str, payload: ManualOverrideCreate, operator: str = Depends(require_write_key)):
+def upsert_override(market_id: str, payload: ManualOverrideCreate, operator: AuthUser = Depends(require_operator)):
+    created_by = operator.email
     if not market_exists(market_id):
         raise HTTPException(
             status_code=404,
@@ -2409,7 +3665,7 @@ RETURNING
         with conn.cursor() as cur:
             cur.execute(
                 q,
-                (market_id, payload.day, payload.risk_score_override, payload.health_score_override, payload.note, operator),
+                (market_id, payload.day, payload.risk_score_override, payload.health_score_override, payload.note, created_by),
             )
             row = cur.fetchone()
             conn.commit()

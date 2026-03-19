@@ -1,0 +1,4 @@
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+websockets>=12.0

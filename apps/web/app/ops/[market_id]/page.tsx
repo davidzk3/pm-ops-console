@@ -1,6 +1,7 @@
 import Link from "next/link";
 import OperatorConsolePanel from "./OperatorConsolePanel";
 import OverridePanel from "./OverridePanel";
+import IntegrityTrend from "./IntegrityTrend";
 
 /* -----------------------------
    Core types
@@ -18,7 +19,7 @@ type Market = {
   title: string;
   category: string | null;
   day: string;
-  volume: number;
+  volume: number | null;
   trades: number;
   unique_traders: number;
   spread_median: number | null;
@@ -26,6 +27,22 @@ type Market = {
   concentration_hhi: number | null;
   health_score: number | null;
   risk_score: number | null;
+
+  integrity_score?: number | null;
+  integrity_band?: string | null;
+  radar_risk_score?: number | null;
+  manipulation_score?: number | null;
+  review_priority?: string | null;
+  primary_reason?: string | null;
+  regime?: string | null;
+
+  has_regime_data?: boolean | null;
+  has_radar_data?: boolean | null;
+  has_manipulation_data?: boolean | null;
+  data_completeness_score?: number | null;
+  is_partial_coverage?: boolean | null;
+  needs_operator_review?: boolean | null;
+
   flags: Flag[];
   has_manual_override?: boolean;
 };
@@ -80,7 +97,6 @@ type InterventionEffect = {
   after: EffectBlock | null;
   delta: EffectBlock | null;
 
-  // optional extras from API (safe)
   delta_score?: number | null;
   roi_score?: number | null;
 };
@@ -132,14 +148,14 @@ type ManualOverride = {
 
 type TimelineRow = {
   day: string;
-  volume?: number;
-  trades?: number;
-  unique_traders?: number;
-  spread_median?: number;
-  depth_2pct_median?: number;
-  concentration_hhi?: number;
-  health_score?: number;
-  risk_score?: number;
+  volume?: number | null;
+  trades?: number | null;
+  unique_traders?: number | null;
+  spread_median?: number | null;
+  depth_2pct_median?: number | null;
+  concentration_hhi?: number | null;
+  health_score?: number | null;
+  risk_score?: number | null;
 };
 
 /* ---------------------------------------
@@ -151,7 +167,7 @@ type IncidentEventRow = {
   incident_id: number;
   market_id: string;
   day: string;
-  event_type: string; // CREATED | STATUS_CHANGE (you can add more later)
+  event_type: string;
   from_status: string | null;
   to_status: string | null;
   note: string | null;
@@ -200,7 +216,7 @@ type MarketImpactResponse = {
 };
 
 type MarketImpactHistoryPoint = {
-  anchor_day: string; // YYYY-MM-DD
+  anchor_day: string;
   window_days: number;
   recent_window: { start: string; end: string };
   diagnosis: string;
@@ -219,22 +235,23 @@ function toTs(isoLike: string | null | undefined, dayFallback?: string | null) {
   return 0;
 }
 
-/** Consistent timestamp formatter for server components */
 function fmtWhen(isoLike: string | null | undefined, dayFallback?: string | null) {
   if (isoLike) {
     const d = new Date(isoLike);
     if (!Number.isNaN(d.getTime())) {
-      // stable regardless of server locale
       return d.toISOString().replace("T", " ").replace("Z", " UTC");
     }
   }
   return dayFallback ? `${dayFallback}` : "-";
 }
 
-function buildActivityFeed(args: { incidentEvents: IncidentEventRow[]; interventions: InterventionRow[]; overrides: ManualOverride[] }) {
+function buildActivityFeed(args: {
+  incidentEvents: IncidentEventRow[];
+  interventions: InterventionRow[];
+  overrides: ManualOverride[];
+}) {
   const out: ActivityEvent[] = [];
 
-  // Incident events (append-only)
   for (const ev of args.incidentEvents ?? []) {
     const et = (ev.event_type ?? "").toUpperCase();
     const toStatus = (ev.to_status ?? "").toUpperCase() || null;
@@ -244,15 +261,14 @@ function buildActivityFeed(args: { incidentEvents: IncidentEventRow[]; intervent
     let subtitle: string | null = `incident #${ev.incident_id} · ${ev.day}`;
 
     if (et === "CREATED") {
-      title = `Incident opened`;
+      title = "Incident opened";
       if (ev.note) title += `: ${ev.note}`;
       subtitle = `#${ev.incident_id} · ${ev.day}`;
     } else if (et === "STATUS_CHANGE") {
-      title = `Incident status changed`;
+      title = "Incident status changed";
       if (fromStatus && toStatus) title = `Incident moved ${fromStatus} → ${toStatus}`;
       if (ev.note) subtitle = `${subtitle} · note: ${ev.note}`;
     } else {
-      // fallback for future event types
       title = `Incident ${et || "EVENT"}`;
       if (ev.note) subtitle = `${subtitle} · ${ev.note}`;
     }
@@ -270,7 +286,6 @@ function buildActivityFeed(args: { incidentEvents: IncidentEventRow[]; intervent
     });
   }
 
-  // Interventions (planned + applied)
   for (const itv of args.interventions ?? []) {
     out.push({
       ts: toTs(itv.created_at, itv.day),
@@ -299,10 +314,15 @@ function buildActivityFeed(args: { incidentEvents: IncidentEventRow[]; intervent
     }
   }
 
-  // Overrides
   for (const o of args.overrides ?? []) {
-    const risk = o.risk_score_override === null || o.risk_score_override === undefined ? "-" : String(o.risk_score_override);
-    const health = o.health_score_override === null || o.health_score_override === undefined ? "-" : String(o.health_score_override);
+    const risk =
+      o.risk_score_override === null || o.risk_score_override === undefined
+        ? "-"
+        : String(o.risk_score_override);
+    const health =
+      o.health_score_override === null || o.health_score_override === undefined
+        ? "-"
+        : String(o.health_score_override);
 
     out.push({
       ts: toTs(o.created_at, o.day),
@@ -339,21 +359,15 @@ function statusBadge(status?: string | null) {
   return "bg-gray-50 text-gray-700 border-gray-200";
 }
 
-/* ------------------------------------- */
+function compactBadgeClass(kind: "neutral" | "good" | "warn" | "bad") {
+  if (kind === "good") return "border-green-200 bg-green-50 text-green-800";
+  if (kind === "warn") return "border-yellow-200 bg-yellow-50 text-yellow-900";
+  if (kind === "bad") return "border-red-200 bg-red-50 text-red-800";
+  return "border-gray-200 bg-gray-50 text-gray-700";
+}
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 
-// Effectiveness windows (UI contract)
-// days = attribution window
-// afterDays = how far after the incident day we compare (capped to latest available day)
-const INCIDENT_EFFECT_DAYS = 30;
-const INCIDENT_AFTER_DAYS = 3;
-
-const INTERVENTION_EFFECT_DAYS = 30;
-// keep 0 for now unless you also add after_days for interventions endpoint
-const INTERVENTION_AFTER_DAYS = 0;
-
-/** NEW: single-call snapshot contract (shipability) */
 type TraderSummaryRow = {
   trader_id: string;
   days_active: number;
@@ -410,7 +424,6 @@ type MarketSnapshotResponse = {
   incident_effectiveness: IncidentEffect[];
   interventions: InterventionRow[];
 
-  // ✅ plural keys from backend snapshot
   interventions_effectiveness: InterventionEffect[];
   interventions_effectiveness_ui: InterventionsEffectivenessUi | null;
 
@@ -422,55 +435,50 @@ type MarketSnapshotResponse = {
   errors: { key?: string; message?: string; status?: number }[];
 };
 
-async function fetchInbox(): Promise<Market[]> {
-  const res = await fetch(`${API_BASE}/ops/inbox`, { cache: "no-store" });
-  if (!res.ok) return [];
-  return res.json();
-}
-
-/**
- * Snapshot fetch:
- * - One call for the whole page
- * - Hardens UI: if server returns partials, we still render using defaults.
- */
 async function fetchMarketSnapshot(marketId: string): Promise<MarketSnapshotResponse | null> {
-  const res = await fetch(`${API_BASE}/ops/markets/${encodeURIComponent(marketId)}/snapshot`, { cache: "no-store" });
+  const res = await fetch(
+    `${API_BASE}/ops/markets/${encodeURIComponent(marketId)}/snapshot`,
+    { cache: "no-store" },
+  );
   if (!res.ok) return null;
 
   const raw: any = await res.json();
 
-  // Normalize to always have arrays (never null)
   const out: MarketSnapshotResponse = {
     market: raw?.market ?? null,
     timeline: Array.isArray(raw?.timeline) ? raw.timeline : [],
     incidents: Array.isArray(raw?.incidents) ? raw.incidents : [],
     incident_events: Array.isArray(raw?.incident_events) ? raw.incident_events : [],
-    incident_effectiveness: Array.isArray(raw?.incident_effectiveness) ? raw.incident_effectiveness : [],
+    incident_effectiveness: Array.isArray(raw?.incident_effectiveness)
+      ? raw.incident_effectiveness
+      : [],
     interventions: Array.isArray(raw?.interventions) ? raw.interventions : [],
-
-    // ✅ new snapshot keys
-    interventions_effectiveness: Array.isArray(raw?.interventions_effectiveness) ? raw.interventions_effectiveness : [],
+    interventions_effectiveness: Array.isArray(raw?.interventions_effectiveness)
+      ? raw.interventions_effectiveness
+      : [],
     interventions_effectiveness_ui: raw?.interventions_effectiveness_ui ?? null,
-
     intervention_cumulative: raw?.intervention_cumulative ?? null,
-
     overrides: Array.isArray(raw?.overrides) ? raw.overrides : [],
     traders: {
       summary: Array.isArray(raw?.traders?.summary) ? raw.traders.summary : [],
-      cohorts_summary: Array.isArray(raw?.traders?.cohorts_summary) ? raw.traders.cohorts_summary : [],
-      intelligence: Array.isArray(raw?.traders?.intelligence) ? raw.traders.intelligence : [],
+      cohorts_summary: Array.isArray(raw?.traders?.cohorts_summary)
+        ? raw.traders.cohorts_summary
+        : [],
+      intelligence: Array.isArray(raw?.traders?.intelligence)
+        ? raw.traders.intelligence
+        : [],
     },
     impact: raw?.impact ?? null,
     errors: Array.isArray(raw?.errors) ? raw.errors : [],
   };
 
-  // accept correct field + common misspelling (in case)
   if (out.impact) {
     const data: any = out.impact as any;
     const rawRegime = data?.market_regime ?? data?.market_regiem ?? null;
     if (!rawRegime) {
       const dx = String(data?.diagnosis ?? "").toUpperCase();
-      (out.impact as any).market_regime = dx === "LIQUIDITY_IMPROVING" ? "LIQUIDITY_EXPANSION" : "STABLE";
+      (out.impact as any).market_regime =
+        dx === "LIQUIDITY_IMPROVING" ? "LIQUIDITY_EXPANSION" : "STABLE";
     } else {
       (out.impact as any).market_regime = String(rawRegime);
     }
@@ -500,19 +508,22 @@ function addDaysIso(day: string, deltaDays: number): string | null {
   return toIsoDayUtc(d);
 }
 
-/** market impact history from snapshot-based impact endpoint (still multiple calls, but small + safe) */
-async function fetchMarketImpact(marketId: string, opts?: { days?: number; anchor_day?: string | null }): Promise<MarketImpactResponse | null> {
-  const days = typeof opts?.days === "number" ? opts!.days : 14;
-  const anchor = (opts?.anchor_day ?? null) ? `&anchor_day=${encodeURIComponent(String(opts!.anchor_day))}` : "";
+async function fetchMarketImpact(
+  marketId: string,
+  opts?: { days?: number; anchor_day?: string | null },
+): Promise<MarketImpactResponse | null> {
+  const days = typeof opts?.days === "number" ? opts.days : 14;
+  const anchor = opts?.anchor_day
+    ? `&anchor_day=${encodeURIComponent(String(opts.anchor_day))}`
+    : "";
 
-  const res = await fetch(`${API_BASE}/ops/markets/${encodeURIComponent(marketId)}/traders/impact?days=${days}${anchor}`, {
-    cache: "no-store",
-  });
+  const res = await fetch(
+    `${API_BASE}/ops/markets/${encodeURIComponent(marketId)}/traders/impact?days=${days}${anchor}`,
+    { cache: "no-store" },
+  );
   if (!res.ok) return null;
 
   const data: any = await res.json();
-
-  // accept correct field + common misspelling (in case)
   const rawRegime = data?.market_regime ?? data?.market_regiem ?? null;
 
   if (!rawRegime) {
@@ -525,7 +536,11 @@ async function fetchMarketImpact(marketId: string, opts?: { days?: number; ancho
   return data as MarketImpactResponse;
 }
 
-async function fetchMarketImpactHistory(marketId: string, latestDay: string, windowDays = 14): Promise<MarketImpactHistoryPoint[]> {
+async function fetchMarketImpactHistory(
+  marketId: string,
+  latestDay: string,
+  windowDays = 14,
+): Promise<MarketImpactHistoryPoint[]> {
   const anchors = [0, -7, -14, -21]
     .map((d) => addDaysIso(latestDay, d))
     .filter((x): x is string => Boolean(x));
@@ -542,7 +557,7 @@ async function fetchMarketImpactHistory(marketId: string, latestDay: string, win
         diagnosis: imp.diagnosis,
         market_regime: imp.market_regime,
       } as MarketImpactHistoryPoint;
-    })
+    }),
   );
 
   return rows
@@ -582,12 +597,20 @@ function actionPlanForFlag(flag: Flag) {
     case "SPREAD_BLOWOUT":
       return {
         title: "Liquidity degradation detected",
-        actions: ["Confirm LP quoting status", "Temporarily increase maker rewards", "Monitor spread and depth every few hours"],
+        actions: [
+          "Confirm LP quoting status",
+          "Temporarily increase maker rewards",
+          "Monitor spread and depth every few hours",
+        ],
       };
     case "WHALE_DOMINANCE":
       return {
         title: "Excess trader concentration",
-        actions: ["Reduce per wallet reward caps", "Add diminishing rewards on size", "Watch HHI daily"],
+        actions: [
+          "Reduce per wallet reward caps",
+          "Add diminishing rewards on size",
+          "Watch HHI daily",
+        ],
       };
     default:
       return {
@@ -617,9 +640,12 @@ function deltaBadge(metric: string, d: any) {
   const goodWhenDown = new Set(["spread_median", "concentration_hhi", "risk_score"]);
   const isGood = goodWhenDown.has(metric) ? d < 0 : d > 0;
 
-  const cls = isGood ? "bg-green-100 text-green-800 border-green-300" : "bg-red-100 text-red-800 border-red-300";
+  const cls = isGood
+    ? "bg-green-100 text-green-800 border-green-300"
+    : "bg-red-100 text-red-800 border-red-300";
   const sign = d > 0 ? "+" : "";
-  const val = metric.includes("spread") || metric.includes("hhi") ? fmtFloat(d, 4) : fmtNumber(d);
+  const val =
+    metric.includes("spread") || metric.includes("hhi") ? fmtFloat(d, 4) : fmtNumber(d);
 
   return (
     <span className={`text-xs px-2 py-0.5 rounded-full border ${cls}`}>
@@ -638,19 +664,24 @@ function EmptyState({ text }: { text: string }) {
 ------------------------------ */
 function flagChipClass(flag: string) {
   const f = (flag ?? "").toUpperCase();
-  if (f.includes("DOMINANCE") || f.includes("RISK")) return "bg-red-50 text-red-800 border-red-200";
-  if (f.includes("EROSION") || f.includes("THIN") || f.includes("LOW_CONVICTION")) return "bg-yellow-50 text-yellow-900 border-yellow-200";
+  if (f.includes("DOMINANCE") || f.includes("RISK"))
+    return "bg-red-50 text-red-800 border-red-200";
+  if (f.includes("EROSION") || f.includes("THIN") || f.includes("LOW_CONVICTION"))
+    return "bg-yellow-50 text-yellow-900 border-yellow-200";
   if (f.includes("STABLE")) return "bg-green-50 text-green-800 border-green-200";
   return "bg-gray-50 text-gray-700 border-gray-200";
 }
 
-// market regime badge helper
 function regimeBadgeClass(regime: string) {
   const r = (regime ?? "").toUpperCase();
-  if (r === "MICROSTRUCTURE_STRESS" || r === "EXECUTION_DEGRADING") return "bg-red-50 text-red-800 border-red-200";
-  if (r === "PARTICIPATION_DECAY" || r === "LIQUIDITY_THINNING") return "bg-yellow-50 text-yellow-900 border-yellow-200";
-  if (r === "LIQUIDITY_EXPANSION" || r === "PARTICIPATION_GROWTH") return "bg-blue-50 text-blue-800 border-blue-200";
-  if (r === "STRUCTURALLY_HEALTHY") return "bg-green-50 text-green-800 border-green-200";
+  if (r === "MICROSTRUCTURE_STRESS" || r === "EXECUTION_DEGRADING")
+    return "bg-red-50 text-red-800 border-red-200";
+  if (r === "PARTICIPATION_DECAY" || r === "LIQUIDITY_THINNING")
+    return "bg-yellow-50 text-yellow-900 border-yellow-200";
+  if (r === "LIQUIDITY_EXPANSION" || r === "PARTICIPATION_GROWTH")
+    return "bg-blue-50 text-blue-800 border-blue-200";
+  if (r === "STRUCTURALLY_HEALTHY")
+    return "bg-green-50 text-green-800 border-green-200";
   return "bg-gray-50 text-gray-700 border-gray-200";
 }
 
@@ -659,28 +690,27 @@ function arrowForDelta(isGood: boolean, d: number) {
   return isGood ? "↑" : "↓";
 }
 
-/**
- * Market-quality badge:
- * - Adds arrow (↑ good, ↓ bad, → flat)
- * - Keeps your existing goodWhenDown logic
- */
 function metricBadgeFromDelta(metric: string, d: any) {
   if (d === null || d === undefined || typeof d !== "number" || !Number.isFinite(d)) {
     return <span className="text-xs text-gray-400">n/a</span>;
   }
 
-  // These are "good when down" for impact deltas (note: *_delta keys)
   const goodWhenDown = new Set(["spread_median_delta", "concentration_hhi_delta"]);
   const isGood = goodWhenDown.has(metric) ? d < 0 : d > 0;
 
-  const cls = isGood ? "bg-green-100 text-green-800 border-green-300" : "bg-red-100 text-red-800 border-red-300";
+  const cls = isGood
+    ? "bg-green-100 text-green-800 border-green-300"
+    : "bg-red-100 text-red-800 border-red-300";
   const sign = d > 0 ? "+" : "";
-  const val = metric.includes("spread") || metric.includes("hhi") ? fmtFloat(d, 4) : fmtNumber(d);
+  const val =
+    metric.includes("spread") || metric.includes("hhi") ? fmtFloat(d, 4) : fmtNumber(d);
 
   const arrow = arrowForDelta(isGood, d);
 
   return (
-    <span className={`text-xs px-2 py-0.5 rounded-full border inline-flex items-center gap-1 ${cls}`}>
+    <span
+      className={`text-xs px-2 py-0.5 rounded-full border inline-flex items-center gap-1 ${cls}`}
+    >
       <span className="leading-none">{arrow}</span>
       <span className="leading-none">
         {sign}
@@ -705,8 +735,11 @@ function shareDeltaPct(x: any) {
 
 function deltaChipClass(d: number) {
   const n = typeof d === "number" ? d : Number(d);
-  if (!Number.isFinite(n) || Math.abs(n) < 1e-12) return "bg-gray-50 text-gray-700 border-gray-200";
-  return n > 0 ? "bg-green-50 text-green-800 border-green-200" : "bg-red-50 text-red-800 border-red-200";
+  if (!Number.isFinite(n) || Math.abs(n) < 1e-12)
+    return "bg-gray-50 text-gray-700 border-gray-200";
+  return n > 0
+    ? "bg-green-50 text-green-800 border-green-200"
+    : "bg-red-50 text-red-800 border-red-200";
 }
 
 function arrowForPp(d: number) {
@@ -731,10 +764,14 @@ function activeShareIndex(impact: MarketImpactResponse) {
   const r = cohortShareMap(impact.recent_cohort_share);
   const p = cohortShareMap(impact.prior_cohort_share);
 
-  const rActive = typeof r["ACTIVE"]?.notional_share === "number" ? r["ACTIVE"].notional_share : NaN;
-  const pActive = typeof p["ACTIVE"]?.notional_share === "number" ? p["ACTIVE"].notional_share : NaN;
+  const rActive =
+    typeof r["ACTIVE"]?.notional_share === "number" ? r["ACTIVE"].notional_share : NaN;
+  const pActive =
+    typeof p["ACTIVE"]?.notional_share === "number" ? p["ACTIVE"].notional_share : NaN;
 
-  if (!Number.isFinite(rActive) || !Number.isFinite(pActive) || pActive <= 1e-12) return null;
+  if (!Number.isFinite(rActive) || !Number.isFinite(pActive) || pActive <= 1e-12) {
+    return null;
+  }
   return rActive / pActive;
 }
 
@@ -746,69 +783,103 @@ function fmtIndex(x: number | null) {
 
 function indexChipClass(x: number | null) {
   if (x === null) return "bg-gray-50 text-gray-700 border-gray-200";
-  // 1.00 = flat. below 0.90 is deterioration worth highlighting
   if (x < 0.9) return "bg-yellow-50 text-yellow-900 border-yellow-200";
   if (x > 1.1) return "bg-green-50 text-green-800 border-green-200";
   return "bg-gray-50 text-gray-700 border-gray-200";
 }
 
 function institutionalHeadline(impact: MarketImpactResponse) {
-  const flags = (impact.cohort_risk_flags ?? []).map((x) => String(x ?? "").toUpperCase());
+  const flags = (impact.cohort_risk_flags ?? []).map((x) =>
+    String(x ?? "").toUpperCase(),
+  );
   const q = impact.market_quality_delta ?? {};
 
-  const spread = typeof q["spread_median_delta"] === "number" ? q["spread_median_delta"] : NaN;
-  const hhi = typeof q["concentration_hhi_delta"] === "number" ? q["concentration_hhi_delta"] : NaN;
+  const spread =
+    typeof q["spread_median_delta"] === "number" ? q["spread_median_delta"] : NaN;
+  const hhi =
+    typeof q["concentration_hhi_delta"] === "number"
+      ? q["concentration_hhi_delta"]
+      : NaN;
 
-  const microBad = (Number.isFinite(spread) && spread > 0) || (Number.isFinite(hhi) && hhi > 0);
+  const microBad =
+    (Number.isFinite(spread) && spread > 0) || (Number.isFinite(hhi) && hhi > 0);
   const middleErosion = flags.includes("MIDDLE_LAYER_EROSION");
   const thinMiddle = flags.includes("THIN_MIDDLE_LAYER");
 
-  // Priority order: what you want an ops analyst to react to immediately
   if (microBad) {
-    return { text: "Execution quality deteriorating (spread or concentration rising)", cls: "bg-red-50 text-red-800 border-red-200" };
+    return {
+      text: "Execution quality deteriorating (spread or concentration rising)",
+      cls: "bg-red-50 text-red-800 border-red-200",
+    };
   }
   if (middleErosion) {
-    return { text: "Active trader base shrinking (middle layer erosion)", cls: "bg-yellow-50 text-yellow-900 border-yellow-200" };
+    return {
+      text: "Active trader base shrinking (middle layer erosion)",
+      cls: "bg-yellow-50 text-yellow-900 border-yellow-200",
+    };
   }
   if (thinMiddle) {
-    return { text: "Thin middle layer (market depends on casual flow and whales)", cls: "bg-yellow-50 text-yellow-900 border-yellow-200" };
+    return {
+      text: "Thin middle layer (market depends on casual flow and whales)",
+      cls: "bg-yellow-50 text-yellow-900 border-yellow-200",
+    };
   }
-  return { text: "No dominant institutional risk detected in this window", cls: "bg-green-50 text-green-800 border-green-200" };
+  return {
+    text: "No dominant institutional risk detected in this window",
+    cls: "bg-green-50 text-green-800 border-green-200",
+  };
 }
 
 function execSummary(impact: MarketImpactResponse) {
   const q = impact.market_quality_delta ?? {};
 
-  const spread = typeof q["spread_median_delta"] === "number" ? q["spread_median_delta"] : NaN;
-  const hhi = typeof q["concentration_hhi_delta"] === "number" ? q["concentration_hhi_delta"] : NaN;
+  const spread =
+    typeof q["spread_median_delta"] === "number" ? q["spread_median_delta"] : NaN;
+  const hhi =
+    typeof q["concentration_hhi_delta"] === "number"
+      ? q["concentration_hhi_delta"]
+      : NaN;
   const depth = typeof q["depth_2pct_delta"] === "number" ? q["depth_2pct_delta"] : NaN;
-  const traders = typeof q["unique_traders_delta"] === "number" ? q["unique_traders_delta"] : NaN;
-  const health = typeof q["health_score_delta"] === "number" ? q["health_score_delta"] : NaN;
+  const traders =
+    typeof q["unique_traders_delta"] === "number" ? q["unique_traders_delta"] : NaN;
+  const health =
+    typeof q["health_score_delta"] === "number" ? q["health_score_delta"] : NaN;
 
-  const microBad = (Number.isFinite(spread) && spread > 0) || (Number.isFinite(hhi) && hhi > 0);
-  const participationBad = (Number.isFinite(traders) && traders < 0) || (Number.isFinite(health) && health < 0);
-  const liquidityGood = Number.isFinite(depth) && depth > 0 && (Number.isFinite(spread) ? spread <= 0 : true);
+  const microBad =
+    (Number.isFinite(spread) && spread > 0) || (Number.isFinite(hhi) && hhi > 0);
+  const participationBad =
+    (Number.isFinite(traders) && traders < 0) ||
+    (Number.isFinite(health) && health < 0);
+  const liquidityGood =
+    Number.isFinite(depth) && depth > 0 && (Number.isFinite(spread) ? spread <= 0 : true);
 
-  const flags = (impact.cohort_risk_flags ?? []).map((x) => (x ?? "").toUpperCase());
+  const flags = (impact.cohort_risk_flags ?? []).map((x) =>
+    (x ?? "").toUpperCase(),
+  );
   const middleThin = flags.some((f) => f.includes("THIN_MIDDLE") || f.includes("MIDDLE_LAYER"));
 
-  // One-line, operator-friendly
   if (microBad && participationBad) {
-    return `Execution quality deteriorated (spread or HHI up) alongside weaker participation (traders or health down).`;
+    return "Execution quality deteriorated (spread or HHI up) alongside weaker participation (traders or health down).";
   }
   if (microBad && !participationBad) {
-    return `Microstructure worsened (spread or HHI up) despite stable participation.`;
+    return "Microstructure worsened (spread or HHI up) despite stable participation.";
   }
   if (!microBad && liquidityGood && !participationBad) {
-    return `Liquidity conditions improved (depth up, spread stable or down) with stable participation.`;
+    return "Liquidity conditions improved (depth up, spread stable or down) with stable participation.";
   }
   if (middleThin && !microBad) {
-    return `Cohort mix is shifting with a thinner middle layer; monitor durability of liquidity.`;
+    return "Cohort mix is shifting with a thinner middle layer; monitor durability of liquidity.";
   }
-  return `Mixed signals across microstructure and cohort composition; monitor next window.`;
+  return "Mixed signals across microstructure and cohort composition; monitor next window.";
 }
 
-function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse | null; history: MarketImpactHistoryPoint[] }) {
+function MarketImpactPanel({
+  impact,
+  history,
+}: {
+  impact: MarketImpactResponse | null;
+  history: MarketImpactHistoryPoint[];
+}) {
   if (!impact) return <EmptyState text="No impact data available yet." />;
 
   const q = impact.market_quality_delta ?? {};
@@ -819,10 +890,10 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
     diagnosis === "LIQUIDITY_IMPROVING"
       ? "bg-green-50 text-green-800 border-green-200"
       : diagnosis === "CONCENTRATION_RISK"
-      ? "bg-red-50 text-red-800 border-red-200"
-      : diagnosis === "PARTICIPATION_EXPANDING"
-      ? "bg-blue-50 text-blue-800 border-blue-200"
-      : "bg-gray-50 text-gray-700 border-gray-200";
+        ? "bg-red-50 text-red-800 border-red-200"
+        : diagnosis === "PARTICIPATION_EXPANDING"
+          ? "bg-blue-50 text-blue-800 border-blue-200"
+          : "bg-gray-50 text-gray-700 border-gray-200";
 
   const head = institutionalHeadline(impact);
   const activeIdx = activeShareIndex(impact);
@@ -832,19 +903,31 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <div className="font-medium">Institutional impact (window {impact.window_days}d)</div>
-            <span className={`text-xs px-2 py-0.5 rounded-full border ${diagCls}`}>{diagnosis}</span>
-            <span className={`text-xs px-2 py-0.5 rounded-full border ${regimeBadgeClass(regime)}`}>{regime}</span>
+            <div className="font-medium">Operational impact (window {impact.window_days}d)</div>
+            <span className={`text-xs px-2 py-0.5 rounded-full border ${diagCls}`}>
+              {diagnosis}
+            </span>
+            <span
+              className={`text-xs px-2 py-0.5 rounded-full border ${regimeBadgeClass(regime)}`}
+            >
+              {regime}
+            </span>
           </div>
 
           <div className="mt-2">
-            <span className={`text-xs px-2 py-0.5 rounded-full border inline-flex items-center ${head.cls}`}>{head.text}</span>
+            <span
+              className={`text-xs px-2 py-0.5 rounded-full border inline-flex items-center ${head.cls}`}
+            >
+              {head.text}
+            </span>
           </div>
 
           <div className="text-sm text-gray-700 mt-2">{execSummary(impact)}</div>
 
           <div className="mt-2 flex flex-wrap gap-2">
-            <span className={`text-xs px-2 py-0.5 rounded-full border inline-flex items-center gap-2 ${indexChipClass(activeIdx)}`}>
+            <span
+              className={`text-xs px-2 py-0.5 rounded-full border inline-flex items-center gap-2 ${indexChipClass(activeIdx)}`}
+            >
               <span className="text-gray-700">Active notional index</span>
               <span className="font-medium">{fmtIndex(activeIdx)}</span>
             </span>
@@ -857,7 +940,8 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
           </div>
 
           <div className="text-xs text-gray-500 mt-2">
-            Prior: <span className="font-medium">{impact.prior_window?.start}</span> → <span className="font-medium">{impact.prior_window?.end}</span>
+            Prior: <span className="font-medium">{impact.prior_window?.start}</span> →{" "}
+            <span className="font-medium">{impact.prior_window?.end}</span>
           </div>
 
           {history?.length ? (
@@ -871,8 +955,14 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
                     <div key={h.anchor_day} className="px-2 py-1 rounded-lg border bg-white">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-[11px] text-gray-500">{h.anchor_day}</span>
-                        <span className={`text-[11px] px-2 py-0.5 rounded-full border ${regimeBadgeClass(reg)}`}>{reg}</span>
-                        <span className="text-[11px] px-2 py-0.5 rounded-full border bg-gray-50 border-gray-200 text-gray-700">{diag}</span>
+                        <span
+                          className={`text-[11px] px-2 py-0.5 rounded-full border ${regimeBadgeClass(reg)}`}
+                        >
+                          {reg}
+                        </span>
+                        <span className="text-[11px] px-2 py-0.5 rounded-full border bg-gray-50 border-gray-200 text-gray-700">
+                          {diag}
+                        </span>
                       </div>
                       <div className="text-[11px] text-gray-500 mt-1">
                         {h.recent_window?.start} → {h.recent_window?.end}
@@ -887,7 +977,10 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
 
         <div className="flex flex-wrap gap-2">
           {(impact.cohort_risk_flags ?? []).slice(0, 6).map((f, idx) => (
-            <span key={`${f}-${idx}`} className={`text-xs px-2 py-0.5 rounded-full border ${flagChipClass(f)}`}>
+            <span
+              key={`${f}-${idx}`}
+              className={`text-xs px-2 py-0.5 rounded-full border ${flagChipClass(f)}`}
+            >
               {String(f ?? "").toUpperCase()}
             </span>
           ))}
@@ -896,7 +989,7 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
         <div className="border rounded-xl p-3 bg-gray-50">
-          <div className="text-sm font-medium mb-2">Market quality delta</div>
+          <div className="text-sm font-medium mb-2">Execution quality delta</div>
           <div className="flex flex-wrap gap-2">
             <span className="text-xs border rounded-full px-2 py-0.5 bg-white inline-flex items-center gap-2">
               <span>spread</span>
@@ -908,7 +1001,10 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
             </span>
             <span className="text-xs border rounded-full px-2 py-0.5 bg-white inline-flex items-center gap-2">
               <span>hhi</span>
-              {metricBadgeFromDelta("concentration_hhi_delta", q["concentration_hhi_delta"])}
+              {metricBadgeFromDelta(
+                "concentration_hhi_delta",
+                q["concentration_hhi_delta"],
+              )}
             </span>
             <span className="text-xs border rounded-full px-2 py-0.5 bg-white inline-flex items-center gap-2">
               <span>traders</span>
@@ -919,11 +1015,13 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
               {metricBadgeFromDelta("health_score_delta", q["health_score_delta"])}
             </span>
           </div>
-          <div className="text-[11px] text-gray-500 mt-2">For spread and HHI: down is good. For depth, traders, health: up is good.</div>
+          <div className="text-[11px] text-gray-500 mt-2">
+            For spread and HHI: down is good. For depth, traders, health: up is good.
+          </div>
         </div>
 
         <div className="border rounded-xl p-3 bg-gray-50">
-          <div className="text-sm font-medium mb-2">Cohort share delta</div>
+          <div className="text-sm font-medium mb-2">Participation shift</div>
 
           {impact.cohort_share_delta?.length ? (
             <div className="overflow-x-auto border rounded-lg bg-white">
@@ -938,19 +1036,31 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
                 <tbody>
                   {impact.cohort_share_delta.map((r, idx) => (
                     <tr key={`${r.cohort}-${idx}`} className="border-t">
-                      <td className="px-3 py-2 font-medium">{String(r.cohort ?? "").toUpperCase()}</td>
-
+                      <td className="px-3 py-2 font-medium">
+                        {String(r.cohort ?? "").toUpperCase()}
+                      </td>
                       <td className="px-3 py-2 text-right">
-                        <span className={`text-xs px-2 py-0.5 rounded-full border inline-flex items-center gap-1 ${deltaChipClass(r.notional_share_delta)}`}>
-                          <span className="leading-none">{arrowForPp(r.notional_share_delta)}</span>
-                          <span className="leading-none">{shareDeltaPct(r.notional_share_delta)}</span>
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded-full border inline-flex items-center gap-1 ${deltaChipClass(r.notional_share_delta)}`}
+                        >
+                          <span className="leading-none">
+                            {arrowForPp(r.notional_share_delta)}
+                          </span>
+                          <span className="leading-none">
+                            {shareDeltaPct(r.notional_share_delta)}
+                          </span>
                         </span>
                       </td>
-
                       <td className="px-3 py-2 text-right">
-                        <span className={`text-xs px-2 py-0.5 rounded-full border inline-flex items-center gap-1 ${deltaChipClass(r.trade_share_delta)}`}>
-                          <span className="leading-none">{arrowForPp(r.trade_share_delta)}</span>
-                          <span className="leading-none">{shareDeltaPct(r.trade_share_delta)}</span>
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded-full border inline-flex items-center gap-1 ${deltaChipClass(r.trade_share_delta)}`}
+                        >
+                          <span className="leading-none">
+                            {arrowForPp(r.trade_share_delta)}
+                          </span>
+                          <span className="leading-none">
+                            {shareDeltaPct(r.trade_share_delta)}
+                          </span>
                         </span>
                       </td>
                     </tr>
@@ -962,13 +1072,15 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
             <div className="text-sm text-gray-500">No cohort delta available.</div>
           )}
 
-          <div className="text-[11px] text-gray-500 mt-2">Δ shown in percentage points (pp) between recent and prior window.</div>
+          <div className="text-[11px] text-gray-500 mt-2">
+            Δ shown in percentage points (pp) between recent and prior window.
+          </div>
         </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
         <div className="border rounded-xl p-3">
-          <div className="text-sm font-medium mb-2">Recent cohort shares</div>
+          <div className="text-sm font-medium mb-2">Current participation mix</div>
           {impact.recent_cohort_share?.length ? (
             <div className="overflow-x-auto border rounded-lg">
               <table className="w-full text-sm">
@@ -982,7 +1094,9 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
                 <tbody>
                   {impact.recent_cohort_share.map((r, idx) => (
                     <tr key={`${r.cohort}-${idx}`} className="border-t">
-                      <td className="px-3 py-2 font-medium">{String(r.cohort ?? "").toUpperCase()}</td>
+                      <td className="px-3 py-2 font-medium">
+                        {String(r.cohort ?? "").toUpperCase()}
+                      </td>
                       <td className="px-3 py-2 text-right">{sharePct(r.notional_share)}</td>
                       <td className="px-3 py-2 text-right">{sharePct(r.trade_share)}</td>
                     </tr>
@@ -1010,7 +1124,9 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
                 <tbody>
                   {impact.prior_cohort_share.map((r, idx) => (
                     <tr key={`${r.cohort}-${idx}`} className="border-t">
-                      <td className="px-3 py-2 font-medium">{String(r.cohort ?? "").toUpperCase()}</td>
+                      <td className="px-3 py-2 font-medium">
+                        {String(r.cohort ?? "").toUpperCase()}
+                      </td>
                       <td className="px-3 py-2 text-right">{sharePct(r.notional_share)}</td>
                       <td className="px-3 py-2 text-right">{sharePct(r.trade_share)}</td>
                     </tr>
@@ -1027,7 +1143,6 @@ function MarketImpactPanel({ impact, history }: { impact: MarketImpactResponse |
   );
 }
 
-/** Step 5 UI table */
 function TraderSummaryTable({ rows }: { rows: TraderSummaryRow[] }) {
   if (!rows?.length) return <EmptyState text="No trader data yet. Seed trades first." />;
 
@@ -1068,7 +1183,6 @@ function TraderSummaryTable({ rows }: { rows: TraderSummaryRow[] }) {
   );
 }
 
-/** Step 6.1 UI: cohort summary table */
 function CohortSummaryTable({ rows }: { rows: CohortSummaryRow[] }) {
   if (!rows?.length) return <EmptyState text="No cohort data yet. Seed trades first." />;
 
@@ -1113,7 +1227,193 @@ function roleTagBadgeClass(tag: string) {
   return "bg-gray-50 text-gray-700 border-gray-200";
 }
 
-/** Step 6.2 UI: trader intelligence table */
+function scoreTone(score: number | null | undefined, reverse = false) {
+  if (score === null || score === undefined || !Number.isFinite(score)) {
+    return "border-gray-200 bg-gray-50 text-gray-700";
+  }
+
+  const v = Number(score);
+
+  if (reverse) {
+    if (v >= 70) return "border-red-200 bg-red-50 text-red-800";
+    if (v >= 45) return "border-yellow-200 bg-yellow-50 text-yellow-900";
+    return "border-green-200 bg-green-50 text-green-800";
+  }
+
+  if (v >= 70) return "border-green-200 bg-green-50 text-green-800";
+  if (v >= 45) return "border-yellow-200 bg-yellow-50 text-yellow-900";
+  return "border-red-200 bg-red-50 text-red-800";
+}
+
+function reviewStateBadge(
+  hasManualOverride: boolean | undefined,
+  riskScore: number | null | undefined,
+) {
+  if (hasManualOverride) {
+    return "border-blue-200 bg-blue-50 text-blue-800";
+  }
+
+  const v = typeof riskScore === "number" ? riskScore : NaN;
+  if (Number.isFinite(v) && v >= 70) {
+    return "border-red-200 bg-red-50 text-red-800";
+  }
+  if (Number.isFinite(v) && v >= 45) {
+    return "border-yellow-200 bg-yellow-50 text-yellow-900";
+  }
+  return "border-gray-200 bg-gray-50 text-gray-700";
+}
+
+function reviewStateLabel(
+  hasManualOverride: boolean | undefined,
+  riskScore: number | null | undefined,
+) {
+  if (hasManualOverride) return "Override active";
+
+  const v = typeof riskScore === "number" ? riskScore : NaN;
+  if (Number.isFinite(v) && v >= 70) return "Immediate review";
+  if (Number.isFinite(v) && v >= 45) return "Monitor closely";
+  return "Routine monitoring";
+}
+
+function integrityBandClass(band: string | null | undefined) {
+  const b = (band ?? "").toLowerCase();
+
+  if (b === "strong") return "border-green-200 bg-green-50 text-green-800";
+  if (b === "stable") return "border-emerald-200 bg-emerald-50 text-emerald-800";
+  if (b === "fragile") return "border-yellow-200 bg-yellow-50 text-yellow-900";
+  if (b === "review") return "border-orange-200 bg-orange-50 text-orange-800";
+  if (b === "critical") return "border-red-200 bg-red-50 text-red-800";
+
+  return "border-gray-200 bg-gray-50 text-gray-700";
+}
+
+function resolveHeaderMetrics(market: Market) {
+  return {
+    integrityScore:
+      typeof market.integrity_score === "number"
+        ? market.integrity_score
+        : market.health_score,
+
+    radarRiskScore:
+      typeof market.radar_risk_score === "number"
+        ? market.radar_risk_score
+        : market.risk_score,
+
+    manipulationScore:
+      typeof market.manipulation_score === "number"
+        ? market.manipulation_score
+        : null,
+
+    integrityBand: market.integrity_band ?? null,
+    reviewPriority: market.review_priority ?? null,
+    primaryReason: market.primary_reason ?? null,
+    regime: market.regime ?? null,
+  };
+}
+
+function hasUsableImpact(impact: MarketImpactResponse | null) {
+  if (!impact) return false;
+
+  const hasWindows =
+    Boolean(impact.recent_window?.start) ||
+    Boolean(impact.recent_window?.end) ||
+    Boolean(impact.prior_window?.start) ||
+    Boolean(impact.prior_window?.end);
+
+  const deltas = Object.values(impact.market_quality_delta ?? {});
+  const hasNonZeroDelta = deltas.some(
+    (v) => typeof v === "number" && Number.isFinite(v) && Math.abs(v) > 1e-12,
+  );
+
+  const hasCohortData =
+    (impact.recent_cohort_share?.length ?? 0) > 0 ||
+    (impact.prior_cohort_share?.length ?? 0) > 0 ||
+    (impact.cohort_share_delta?.length ?? 0) > 0;
+
+  return hasWindows || hasNonZeroDelta || hasCohortData;
+}
+
+function yesNoBadge(flag: boolean | null | undefined) {
+  if (flag === true) {
+    return "border-green-200 bg-green-50 text-green-800";
+  }
+  if (flag === false) {
+    return "border-gray-200 bg-gray-50 text-gray-700";
+  }
+  return "border-gray-200 bg-gray-50 text-gray-500";
+}
+
+function coverageStateClass(market: Market) {
+  if (market.is_partial_coverage) {
+    return "border-yellow-200 bg-yellow-50 text-yellow-900";
+  }
+
+  const score =
+    typeof market.data_completeness_score === "number"
+      ? market.data_completeness_score
+      : NaN;
+
+  if (Number.isFinite(score) && score >= 0.99) {
+    return "border-green-200 bg-green-50 text-green-800";
+  }
+
+  if (Number.isFinite(score) && score >= 0.5) {
+    return "border-yellow-200 bg-yellow-50 text-yellow-900";
+  }
+
+  return "border-gray-200 bg-gray-50 text-gray-700";
+}
+
+function coverageStateLabel(market: Market) {
+  if (market.is_partial_coverage) return "Partial coverage";
+
+  const score =
+    typeof market.data_completeness_score === "number"
+      ? market.data_completeness_score
+      : NaN;
+
+  if (Number.isFinite(score) && score >= 0.99) return "Full coverage";
+  if (Number.isFinite(score) && score > 0) return "Limited coverage";
+
+  return "Coverage unknown";
+}
+
+function completenessPct(score: number | null | undefined) {
+  if (score === null || score === undefined || !Number.isFinite(score)) {
+    return "—";
+  }
+  return `${(Number(score) * 100).toFixed(0)}%`;
+}
+
+function hasSparseMarketState(args: {
+  timeline: TimelineRow[];
+  traderSummary: TraderSummaryRow[];
+  traderIntelligence: TraderIntelligenceRow[];
+  incidents: IncidentRow[];
+  interventions: InterventionRow[];
+}) {
+  return (
+    args.timeline.length === 0 &&
+    args.traderSummary.length === 0 &&
+    args.traderIntelligence.length === 0 &&
+    args.incidents.length === 0 &&
+    args.interventions.length === 0
+  );
+}
+
+function impactErrorMessage(errors: { key?: string; message?: string; status?: number }[]) {
+  const impactErr = (errors ?? []).find((e) => e.key === "impact");
+  if (!impactErr) return null;
+
+  const msg = String(impactErr.message ?? "").toLowerCase();
+
+  if (msg.includes("no_metrics")) {
+    return "Impact comparison requires market_day history and is not available yet for this market.";
+  }
+
+  return "Impact analysis is temporarily unavailable for this market.";
+}
+
 function TraderIntelligenceTable({ rows }: { rows: TraderIntelligenceRow[] }) {
   if (!rows?.length) return <EmptyState text="No intelligence data yet. Seed trades first." />;
 
@@ -1135,15 +1435,24 @@ function TraderIntelligenceTable({ rows }: { rows: TraderIntelligenceRow[] }) {
 
         <tbody>
           {rows.map((r) => {
-            const buyRatioPct = typeof r.buy_ratio === "number" && Number.isFinite(r.buy_ratio) ? `${(r.buy_ratio * 100).toFixed(1)}%` : "-";
+            const buyRatioPct =
+              typeof r.buy_ratio === "number" && Number.isFinite(r.buy_ratio)
+                ? `${(r.buy_ratio * 100).toFixed(1)}%`
+                : "-";
             return (
               <tr key={r.trader_id} className="border-t">
                 <td className="px-3 py-2 font-mono text-xs">{r.trader_id}</td>
                 <td className="px-3 py-2">
-                  <span className="text-xs px-2 py-0.5 rounded-full border bg-gray-50 border-gray-200">{(r.cohort ?? "UNKNOWN").toUpperCase()}</span>
+                  <span className="text-xs px-2 py-0.5 rounded-full border bg-gray-50 border-gray-200">
+                    {(r.cohort ?? "UNKNOWN").toUpperCase()}
+                  </span>
                 </td>
                 <td className="px-3 py-2">
-                  <span className={`text-xs px-2 py-0.5 rounded-full border ${roleTagBadgeClass(r.role_tag)}`}>{(r.role_tag ?? "RETAIL").toUpperCase()}</span>
+                  <span
+                    className={`text-xs px-2 py-0.5 rounded-full border ${roleTagBadgeClass(r.role_tag)}`}
+                  >
+                    {(r.role_tag ?? "RETAIL").toUpperCase()}
+                  </span>
                 </td>
                 <td className="px-3 py-2 text-right">{fmtNumber(r.days_active)}</td>
                 <td className="px-3 py-2 text-right">{fmtNumber(r.trades)}</td>
@@ -1156,69 +1465,89 @@ function TraderIntelligenceTable({ rows }: { rows: TraderIntelligenceRow[] }) {
         </tbody>
       </table>
 
-      <div className="px-3 py-2 text-xs text-gray-500 border-t bg-gray-50">Role tags are heuristic MVP labels. You can refine logic server-side later.</div>
+      <div className="px-3 py-2 text-xs text-gray-500 border-t bg-gray-50">
+        Role tags are heuristic MVP labels. You can refine logic server-side later.
+      </div>
     </div>
   );
 }
 
 export default async function MarketPage(props: any) {
   const params = await Promise.resolve(props?.params ?? {});
-  const rawMarketId = params.market_id ?? params.marketId ?? params.id ?? props?.market_id ?? props?.marketId ?? "";
+  const rawMarketId =
+    params.market_id ??
+    params.marketId ??
+    params.id ??
+    props?.market_id ??
+    props?.marketId ??
+    "";
   const marketIdStr = String(rawMarketId ?? "").trim();
 
-  // We now rely on snapshot for everything, including the market header.
-  // If marketId is wrong, we still show the old "market not found" debug panel using inbox.
   const snap = marketIdStr ? await fetchMarketSnapshot(marketIdStr) : null;
-  let market: Market | null = (snap?.market as any) ?? null;
-
-  let inboxRows: Market[] = [];
-  if (!market) {
-    inboxRows = await fetchInbox();
-    market = inboxRows.find((r) => String(r.market_id).trim() === marketIdStr) ?? null;
-  }
+  const market: Market | null = (snap?.market as any) ?? null;
 
   if (!market) {
     return (
       <main className="p-8 max-w-3xl">
         <Link href="/ops" className="text-sm text-gray-600 hover:underline">
-          {"<- Back to Ops Inbox"}
+          {"<- Back to Surveillance Queue"}
         </Link>
 
-        <h1 className="text-xl font-semibold mt-4">Market not found</h1>
+        <div className="mt-4 rounded-2xl border bg-white p-6 shadow-sm">
+          <h1 className="text-xl font-semibold">Market snapshot unavailable</h1>
 
-        <p className="text-sm text-gray-500 mt-2">
-          Requested market_id: <code className="px-1 py-0.5 border rounded">{marketIdStr || "(empty)"}</code>
-        </p>
+          <p className="mt-2 text-sm text-gray-600">
+            We could not load investigation data for this market right now.
+          </p>
 
-        <p className="text-sm text-gray-500 mt-2">
-          Available market_ids:{" "}
-          <code className="px-1 py-0.5 border rounded">{inboxRows.length ? inboxRows.map((r) => r.market_id).join(", ") : "(inbox empty)"}</code>
-        </p>
+          <div className="mt-4 space-y-3 text-sm">
+            <div>
+              <span className="text-gray-500">Requested market_id: </span>
+              <code className="rounded border bg-gray-50 px-1 py-0.5">
+                {marketIdStr || "(empty)"}
+              </code>
+            </div>
 
-        <p className="text-sm text-gray-500 mt-4">Debug params:</p>
-        <pre className="text-xs text-gray-600 mt-2 border rounded p-3 overflow-x-auto">{JSON.stringify({ params, propsKeys: Object.keys(props ?? {}) }, null, 2)}</pre>
+            <div>
+              <span className="text-gray-500">Check snapshot endpoint: </span>
+              <code className="rounded border bg-gray-50 px-1 py-0.5 break-all">
+                {`${API_BASE}/ops/markets/${encodeURIComponent(marketIdStr)}/snapshot`}
+              </code>
+            </div>
 
-        <p className="text-sm text-gray-500 mt-4">
-          Verify API:
-          <br />
-          <code className="px-1 py-0.5 border rounded">{`${API_BASE}/ops/markets/m2/snapshot`}</code>
-        </p>
+            <div>
+              <span className="text-gray-500">Check market endpoint: </span>
+              <code className="rounded border bg-gray-50 px-1 py-0.5 break-all">
+                {`${API_BASE}/ops/markets/${encodeURIComponent(marketIdStr)}`}
+              </code>
+            </div>
+          </div>
+
+          <pre className="mt-4 overflow-x-auto rounded-xl border bg-gray-50 p-3 text-xs text-gray-600">
+{JSON.stringify(
+  {
+    params,
+    propsKeys: Object.keys(props ?? {}),
+    snapshotLoaded: Boolean(snap),
+    snapshotErrors: snap?.errors ?? [],
+  },
+  null,
+  2,
+)}
+          </pre>
+        </div>
       </main>
     );
   }
 
   const resolvedId = String(market.market_id).trim();
 
-  // Snapshot provides everything used below (one round trip).
-  // If snapshot is missing (should not happen if market exists), fall back to empty defaults.
   const timeline = snap?.timeline ?? [];
   const incidents = snap?.incidents ?? [];
   const interventions = snap?.interventions ?? [];
   const overrides = snap?.overrides ?? [];
   const incidentEvents = snap?.incident_events ?? [];
   const incidentEffects = snap?.incident_effectiveness ?? [];
-
-  // ✅ now correctly wired
   const interventionEffects = snap?.interventions_effectiveness ?? [];
   const interventionCumulative = snap?.intervention_cumulative ?? null;
 
@@ -1227,16 +1556,18 @@ export default async function MarketPage(props: any) {
   const traderIntelligence = snap?.traders?.intelligence ?? [];
   const impact = snap?.impact ?? null;
 
-  // safer: prefer override matching current market day, then fallback to newest
-  const activeOverride = market.has_manual_override ? overrides.find((o) => o.day === market.day) ?? overrides?.[0] ?? null : null;
+  const activeOverride = market.has_manual_override
+    ? overrides.find((o) => o.day === market.day) ?? overrides?.[0] ?? null
+    : null;
 
-  const timelineSorted = [...(timeline ?? [])].sort((a, b) => String(a.day).localeCompare(String(b.day)));
+  const timelineSorted = [...timeline].sort((a, b) => String(a.day).localeCompare(String(b.day)));
   const latest = timelineSorted.length ? timelineSorted[timelineSorted.length - 1] : null;
-  const prior = timelineSorted.length >= 8 ? timelineSorted[timelineSorted.length - 8] : timelineSorted[0] ?? null;
+  const prior =
+    timelineSorted.length >= 8
+      ? timelineSorted[timelineSorted.length - 8]
+      : timelineSorted[0] ?? null;
 
-  // impact history anchors off latest available day (timeline preferred)
   const latestDayForImpact = String(latest?.day ?? market.day ?? "").trim();
-  const impactHistory = latestDayForImpact ? await fetchMarketImpactHistory(resolvedId, latestDayForImpact, 14) : [];
 
   const dRisk = safeNumber(latest?.risk_score) - safeNumber(prior?.risk_score);
   const dHealth = safeNumber(latest?.health_score) - safeNumber(prior?.health_score);
@@ -1251,30 +1582,365 @@ export default async function MarketPage(props: any) {
     overrides,
   });
 
+  const headerMetrics = resolveHeaderMetrics(market);
+
+  const sparseMarketState = hasSparseMarketState({
+    timeline,
+    traderSummary,
+    traderIntelligence,
+    incidents,
+    interventions,
+  });
+
+  const impactFallback = impactErrorMessage(snap?.errors ?? []);
+
+  const hasTimeline = timelineSorted.length > 0;
+  const hasImpact = hasUsableImpact(impact);
+  const hasTraderSummary = traderSummary.length > 0;
+  const hasCohortSummary = cohortSummary.length > 0;
+  const hasTraderIntelligence = traderIntelligence.length > 0;
+  const hasIncidentEffects = incidentEffects.length > 0;
+
+  const impactHistory =
+    hasImpact && latestDayForImpact
+      ? await fetchMarketImpactHistory(resolvedId, latestDayForImpact, 14)
+      : [];
+
+  const compactStatusItems = [
+    {
+      label: coverageStateLabel(market),
+      kind: market.is_partial_coverage
+        ? "warn"
+        : typeof market.data_completeness_score === "number" &&
+            market.data_completeness_score >= 0.99
+          ? "good"
+          : "neutral",
+    },
+    headerMetrics.integrityBand
+      ? {
+          label: `integrity ${headerMetrics.integrityBand}`,
+          kind:
+            headerMetrics.integrityBand === "strong"
+              ? "good"
+              : headerMetrics.integrityBand === "review" || headerMetrics.integrityBand === "fragile"
+                ? "warn"
+                : headerMetrics.integrityBand === "critical"
+                  ? "bad"
+                  : "neutral",
+        }
+      : null,
+    headerMetrics.reviewPriority
+      ? {
+          label: `priority ${headerMetrics.reviewPriority}`,
+          kind:
+            headerMetrics.reviewPriority === "high"
+              ? "bad"
+              : headerMetrics.reviewPriority === "medium"
+                ? "warn"
+                : "neutral",
+        }
+      : null,
+    headerMetrics.regime
+      ? {
+          label: `regime ${headerMetrics.regime}`,
+          kind:
+            headerMetrics.regime === "organic_market"
+              ? "good"
+              : headerMetrics.regime === "thin_market"
+                ? "warn"
+                : "neutral",
+        }
+      : null,
+    {
+      label: market.needs_operator_review ? "review needed" : "routine monitor",
+      kind: market.needs_operator_review ? "bad" : "neutral",
+    },
+  ].filter(Boolean) as { label: string; kind: "neutral" | "good" | "warn" | "bad" }[];
+
   return (
     <main className="p-8 max-w-5xl">
       <Link href="/ops" className="text-sm text-gray-600 hover:underline">
-        {"<- Back to Ops Inbox"}
+        {"<- Back to Surveillance Queue"}
       </Link>
 
-      <div className="flex items-start justify-between gap-4 mt-2">
-        <div>
-          <h1 className="text-2xl font-semibold">{market.title}</h1>
-          <p className="text-sm text-gray-500 mt-1">
-            {market.market_id} {" - "} {market.protocol} {" - "} {market.chain} {" - "} {market.category ?? "uncategorized"} {" - "} {market.day}
-          </p>
+      <div className="mt-4 rounded-2xl border border-gray-800 bg-gray-950 p-5 text-white shadow-sm">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="inline-flex rounded-full bg-emerald-500/20 px-2.5 py-1 text-xs font-medium text-emerald-300">
+                INVESTIGATION
+              </span>
+
+              <span
+                className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-medium ${reviewStateBadge(
+                  market.has_manual_override,
+                  headerMetrics.radarRiskScore,
+                )}`}
+              >
+                {reviewStateLabel(market.has_manual_override, headerMetrics.radarRiskScore)}
+              </span>
+
+              {headerMetrics.integrityBand ? (
+                <span
+                  className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-medium ${integrityBandClass(
+                    headerMetrics.integrityBand,
+                  )}`}
+                >
+                  {headerMetrics.integrityBand}
+                </span>
+              ) : null}
+
+              {headerMetrics.reviewPriority ? (
+                <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs font-medium text-gray-200">
+                  {headerMetrics.reviewPriority}
+                </span>
+              ) : null}
+            </div>
+
+            <h1 className="mt-3 truncate text-2xl font-semibold tracking-tight text-white">
+              {market.title}
+            </h1>
+
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-300">
+              <span className="rounded-full bg-white/5 px-2 py-1">{market.market_id}</span>
+              <span className="rounded-full bg-white/5 px-2 py-1">{market.protocol}</span>
+              <span className="rounded-full bg-white/5 px-2 py-1">{market.chain}</span>
+              <span className="rounded-full bg-white/5 px-2 py-1">
+                {market.category ?? "uncategorized"}
+              </span>
+              <span className="rounded-full bg-white/5 px-2 py-1">{market.day}</span>
+              {headerMetrics.regime ? (
+                <span className="rounded-full bg-white/5 px-2 py-1">
+                  regime {headerMetrics.regime}
+                </span>
+              ) : null}
+            </div>
+
+            {compactStatusItems.length ? (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {compactStatusItems.map((item, idx) => (
+                  <span
+                    key={`${item.label}-${idx}`}
+                    className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-medium ${compactBadgeClass(item.kind)}`}
+                  >
+                    {item.label}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+
+            {headerMetrics.primaryReason ? (
+              <div className="mt-3 max-w-3xl rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-gray-200">
+                {headerMetrics.primaryReason}
+              </div>
+            ) : null}
+          </div>
+
+          {market.has_manual_override ? (
+            <div className="text-xs px-3 py-1 rounded-full border border-blue-200 bg-blue-50 text-blue-800">
+              Manual override active
+            </div>
+          ) : null}
         </div>
 
-        {market.has_manual_override ? (
-          <div className="text-xs px-3 py-1 rounded-full border bg-blue-50 text-blue-800 border-blue-200">Manual override active</div>
-        ) : null}
+        <div className="mt-5 grid grid-cols-2 gap-3 md:grid-cols-4">
+          <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+            <div className="text-[11px] uppercase tracking-wide text-gray-400">
+              Integrity
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <div className="text-2xl font-semibold text-white">
+                {fmtNumber(headerMetrics.integrityScore)}
+              </div>
+              <span
+                className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium ${scoreTone(
+                  headerMetrics.integrityScore,
+                )}`}
+              >
+                structural
+              </span>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+            <div className="text-[11px] uppercase tracking-wide text-gray-400">
+              Radar Risk
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <div className="text-2xl font-semibold text-white">
+                {fmtNumber(headerMetrics.radarRiskScore)}
+              </div>
+              <span
+                className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium ${scoreTone(
+                  headerMetrics.radarRiskScore,
+                  true,
+                )}`}
+              >
+                operator
+              </span>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+            <div className="text-[11px] uppercase tracking-wide text-gray-400">
+              Manipulation
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <div className="text-2xl font-semibold text-white">
+                {fmtNumber(headerMetrics.manipulationScore)}
+              </div>
+              <span
+                className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium ${scoreTone(
+                  headerMetrics.manipulationScore,
+                  true,
+                )}`}
+              >
+                signal
+              </span>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+            <div className="text-[11px] uppercase tracking-wide text-gray-400">
+              Participants
+            </div>
+            <div className="mt-2 text-2xl font-semibold text-white">
+              {fmtNumber(market.unique_traders)}
+            </div>
+            <div className="mt-1 text-xs text-gray-400">
+              {fmtNumber(market.trades)} trades
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-gray-200">
+            spread {fmtFloat(market.spread_median, 4)}
+          </span>
+          <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-gray-200">
+            depth {fmtNumber(market.depth_2pct_median)}
+          </span>
+          <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-gray-200">
+            HHI {fmtFloat(market.concentration_hhi, 4)}
+          </span>
+          <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-gray-200">
+            volume {fmtNumber(market.volume)}
+          </span>
+        </div>
       </div>
 
-      {/* Snapshot warning strip if server reported partial errors */}
+      <section className="mt-4 rounded-2xl border bg-white p-4 shadow-sm">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-medium text-gray-900">Coverage state</div>
+            <div className="mt-1 text-xs text-gray-500">
+              Explains how much downstream analysis is currently available for this market.
+            </div>
+          </div>
+
+          <span
+            className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-medium ${coverageStateClass(
+              market,
+            )}`}
+          >
+            {coverageStateLabel(market)}
+          </span>
+        </div>
+
+        <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-5">
+          <div className="rounded-xl border bg-gray-50 p-3">
+            <div className="text-[11px] uppercase tracking-wide text-gray-500">
+              Completeness
+            </div>
+            <div className="mt-1 text-lg font-semibold text-gray-900">
+              {completenessPct(market.data_completeness_score)}
+            </div>
+          </div>
+
+          <div className="rounded-xl border bg-gray-50 p-3">
+            <div className="text-[11px] uppercase tracking-wide text-gray-500">
+              Regime
+            </div>
+            <div className="mt-2">
+              <span
+                className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium ${yesNoBadge(
+                  market.has_regime_data,
+                )}`}
+              >
+                {market.has_regime_data ? "available" : "missing"}
+              </span>
+            </div>
+          </div>
+
+          <div className="rounded-xl border bg-gray-50 p-3">
+            <div className="text-[11px] uppercase tracking-wide text-gray-500">
+              Radar
+            </div>
+            <div className="mt-2">
+              <span
+                className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium ${yesNoBadge(
+                  market.has_radar_data,
+                )}`}
+              >
+                {market.has_radar_data ? "available" : "missing"}
+              </span>
+            </div>
+          </div>
+
+          <div className="rounded-xl border bg-gray-50 p-3">
+            <div className="text-[11px] uppercase tracking-wide text-gray-500">
+              Manipulation
+            </div>
+            <div className="mt-2">
+              <span
+                className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium ${yesNoBadge(
+                  market.has_manipulation_data,
+                )}`}
+              >
+                {market.has_manipulation_data ? "available" : "missing"}
+              </span>
+            </div>
+          </div>
+
+          <div className="rounded-xl border bg-gray-50 p-3">
+            <div className="text-[11px] uppercase tracking-wide text-gray-500">
+              Review flag
+            </div>
+            <div className="mt-2">
+              <span
+                className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium ${
+                  market.needs_operator_review
+                    ? "border-red-200 bg-red-50 text-red-800"
+                    : "border-gray-200 bg-gray-50 text-gray-700"
+                }`}
+              >
+                {market.needs_operator_review ? "review needed" : "monitor"}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {market.is_partial_coverage ? (
+          <div className="mt-4 rounded-xl border border-yellow-200 bg-yellow-50 px-3 py-2 text-sm text-yellow-900">
+            This market has partial downstream coverage. Integrity level signals are available,
+            but some deeper sections such as impact, timeline, or trader intelligence may still be sparse.
+          </div>
+        ) : null}
+
+        {sparseMarketState ? (
+          <div className="mt-4 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700">
+            This looks like a sparse live market state. Core market classification is available,
+            but timeline, incidents, interventions, and trader summaries have not populated yet.
+          </div>
+        ) : null}
+      </section>
+
       {snap?.errors?.length ? (
         <div className="mt-4 border rounded-xl p-3 bg-yellow-50 border-yellow-200 text-yellow-900">
           <div className="font-medium text-sm">Snapshot partial errors</div>
-          <div className="text-xs mt-1">Some sub-sections failed server-side, but the page is still rendering.</div>
+          <div className="text-xs mt-1">
+            Some sub-sections failed server-side, but the page is still rendering.
+          </div>
           <ul className="text-xs mt-2 list-disc ml-5">
             {snap.errors.slice(0, 6).map((e, i) => (
               <li key={i}>
@@ -1290,7 +1956,7 @@ export default async function MarketPage(props: any) {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-6">
         <Stat label="Risk score" value={market.risk_score} />
         <Stat label="Health score" value={market.health_score} />
-        <Stat label="Volume" value={Number(market.volume).toLocaleString()} />
+        <Stat label="Volume" value={fmtNumber(market.volume)} />
         <Stat label="Unique traders" value={market.unique_traders} />
         <Stat label="Trades" value={market.trades} />
         <Stat label="Spread (median)" value={market.spread_median} />
@@ -1298,44 +1964,72 @@ export default async function MarketPage(props: any) {
         <Stat label="Concentration (HHI)" value={market.concentration_hhi} />
       </div>
 
-      {/* Institutional impact panel + regime history */}
       <section className="mt-8">
-        <div className="flex items-end justify-between gap-4 mb-3 flex-wrap">
-          <h2 className="font-medium">Institutional impact</h2>
-          <div className="text-xs text-gray-500">
-            Snapshot includes <code className="px-1 py-0.5 border rounded bg-white">{`impact`}</code>
-          </div>
-        </div>
-
-        <MarketImpactPanel impact={impact} history={impactHistory} />
+        <IntegrityTrend marketId={resolvedId} />
       </section>
 
-      {/* Operator quick actions strip (above the fold) */}
+      <section className="mt-8">
+        <div className="flex items-end justify-between gap-4 mb-3 flex-wrap">
+          <h2 className="font-medium">Market Stress & Flow Impact</h2>
+          <div className="text-xs text-gray-500">Rolling 14d impact vs prior window</div>
+        </div>
+
+        {hasImpact ? (
+          <MarketImpactPanel impact={impact} history={impactHistory} />
+        ) : (
+          <div className="rounded-2xl border bg-white p-6 shadow-sm space-y-3">
+            {impactFallback ? (
+              <div className="rounded-xl border border-yellow-200 bg-yellow-50 px-3 py-2 text-sm text-yellow-900">
+                {impactFallback}
+              </div>
+            ) : null}
+
+            <p className="text-sm text-gray-500">
+              Impact diagnostics have not populated for this market yet.
+            </p>
+          </div>
+        )}
+      </section>
+
       <section className="mt-6 border rounded-2xl p-4 bg-gray-50">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="font-medium">Operator actions</div>
           <div className="text-xs text-gray-500">Jump to the main workflow sections</div>
         </div>
         <div className="mt-3 flex flex-wrap gap-2">
-          <a href="#operator-console" className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-gray-100">
+          <a
+            href="#operator-console"
+            className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-gray-100"
+          >
             Incidents and interventions
           </a>
-          <a href="#overrides" className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-gray-100">
+          <a
+            href="#overrides"
+            className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-gray-100"
+          >
             Set override
           </a>
-          <a href="#timeline" className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-gray-100">
+          <a
+            href="#timeline"
+            className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-gray-100"
+          >
             Timeline
           </a>
-          <a href="#activity" className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-gray-100">
+          <a
+            href="#activity"
+            className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-gray-100"
+          >
             Activity feed
           </a>
-          <a href="#traders" className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-gray-100">
+          <a
+            href="#traders"
+            className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-gray-100"
+          >
             Trader intelligence
           </a>
         </div>
       </section>
 
-      {/* overrides */}
       <section id="overrides" className="mt-10">
         <div className="flex items-end justify-between gap-4 mb-3">
           <h2 className="font-medium">
@@ -1349,47 +2043,69 @@ export default async function MarketPage(props: any) {
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="font-medium">
                 Active on {activeOverride.day}
-                <span className="ml-2 text-xs px-2 py-0.5 rounded-full border bg-white border-blue-200 text-blue-800">active</span>
+                <span className="ml-2 text-xs px-2 py-0.5 rounded-full border bg-white border-blue-200 text-blue-800">
+                  active
+                </span>
               </div>
               <div className="text-xs text-gray-600">
-                by {activeOverride.created_by} {" - "} {fmtWhen(activeOverride.created_at, activeOverride.day)}
+                by {activeOverride.created_by} {" - "}{" "}
+                {fmtWhen(activeOverride.created_at, activeOverride.day)}
               </div>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3 text-sm">
               <div className="border rounded-xl p-3 bg-white">
                 <div className="text-xs text-gray-500">Risk override</div>
-                <div className="text-lg font-medium mt-1">{fmtNumber(activeOverride.risk_score_override)}</div>
+                <div className="text-lg font-medium mt-1">
+                  {fmtNumber(activeOverride.risk_score_override)}
+                </div>
               </div>
               <div className="border rounded-xl p-3 bg-white">
                 <div className="text-xs text-gray-500">Health override</div>
-                <div className="text-lg font-medium mt-1">{fmtNumber(activeOverride.health_score_override)}</div>
+                <div className="text-lg font-medium mt-1">
+                  {fmtNumber(activeOverride.health_score_override)}
+                </div>
               </div>
               <div className="border rounded-xl p-3 bg-white">
                 <div className="text-xs text-gray-500">Note</div>
-                <div className="mt-1">{activeOverride.note ?? <span className="text-gray-400">-</span>}</div>
+                <div className="mt-1">
+                  {activeOverride.note ?? <span className="text-gray-400">-</span>}
+                </div>
               </div>
             </div>
 
-            <div className="text-xs text-gray-600 mt-3">Displayed risk and health are overridden for the current market day.</div>
+            <div className="text-xs text-gray-600 mt-3">
+              Displayed risk and health are overridden for the current market day.
+            </div>
           </div>
         ) : null}
 
         {overrides.length ? (
           <div className="mt-3 space-y-2">
             {overrides.map((o, idx) => (
-              <div key={`${o.day}-${idx}`} className="border rounded-xl p-3 bg-white flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+              <div
+                key={`${o.day}-${idx}`}
+                className="border rounded-xl p-3 bg-white flex flex-col md:flex-row md:items-center md:justify-between gap-2"
+              >
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium">{o.day}</span>
                   {idx === 0 && market.has_manual_override ? (
-                    <span className="text-xs px-2 py-0.5 rounded-full border bg-blue-50 text-blue-800 border-blue-200">active</span>
+                    <span className="text-xs px-2 py-0.5 rounded-full border bg-blue-50 text-blue-800 border-blue-200">
+                      active
+                    </span>
                   ) : null}
                 </div>
 
                 <div className="flex flex-wrap gap-2 text-xs">
-                  <span className="px-2 py-0.5 rounded-full border bg-gray-50">risk {fmtNumber(o.risk_score_override)}</span>
-                  <span className="px-2 py-0.5 rounded-full border bg-gray-50">health {fmtNumber(o.health_score_override)}</span>
-                  <span className="px-2 py-0.5 rounded-full border bg-gray-50">by {o.created_by}</span>
+                  <span className="px-2 py-0.5 rounded-full border bg-gray-50">
+                    risk {fmtNumber(o.risk_score_override)}
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full border bg-gray-50">
+                    health {fmtNumber(o.health_score_override)}
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full border bg-gray-50">
+                    by {o.created_by}
+                  </span>
                 </div>
 
                 <div className="text-xs text-gray-500">{fmtWhen(o.created_at, o.day)}</div>
@@ -1412,10 +2128,16 @@ export default async function MarketPage(props: any) {
               <div key={i} className="border rounded-xl p-4">
                 <div className="flex justify-between items-center">
                   <div className="font-medium">{f.flag_code}</div>
-                  <span className={`px-2 py-1 rounded-full border text-xs ${flagStyle(f.severity)}`}>severity {f.severity}</span>
+                  <span
+                    className={`px-2 py-1 rounded-full border text-xs ${flagStyle(f.severity)}`}
+                  >
+                    severity {f.severity}
+                  </span>
                 </div>
 
-                <pre className="text-xs text-gray-600 mt-3 overflow-x-auto">{JSON.stringify(f.details, null, 2)}</pre>
+                <pre className="text-xs text-gray-600 mt-3 overflow-x-auto">
+                  {JSON.stringify(f.details, null, 2)}
+                </pre>
               </div>
             ))}
           </div>
@@ -1451,11 +2173,12 @@ export default async function MarketPage(props: any) {
         )}
       </section>
 
-      {/* audit trail feed (incident_events + interventions + overrides) */}
       <section id="activity" className="mt-12">
         <div className="flex items-end justify-between gap-4 mb-3">
           <h2 className="font-medium">Ops activity feed</h2>
-          <div className="text-xs text-gray-500">Snapshot includes incident_events + interventions + overrides</div>
+          <div className="text-xs text-gray-500">
+            Snapshot includes incident_events + interventions + overrides
+          </div>
         </div>
 
         {activity.length ? (
@@ -1465,14 +2188,26 @@ export default async function MarketPage(props: any) {
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className={`text-[11px] px-2 py-0.5 rounded-full border ${kindBadge(e.kind)}`}>{e.kind}</span>
+                      <span
+                        className={`text-[11px] px-2 py-0.5 rounded-full border ${kindBadge(e.kind)}`}
+                      >
+                        {e.kind}
+                      </span>
 
-                      {e.status ? <span className={`text-[11px] px-2 py-0.5 rounded-full border ${statusBadge(e.status)}`}>{e.status}</span> : null}
+                      {e.status ? (
+                        <span
+                          className={`text-[11px] px-2 py-0.5 rounded-full border ${statusBadge(e.status)}`}
+                        >
+                          {e.status}
+                        </span>
+                      ) : null}
 
                       <div className="font-medium truncate">{e.title}</div>
                     </div>
 
-                    {e.subtitle ? <div className="text-xs text-gray-500 mt-1 truncate">{e.subtitle}</div> : null}
+                    {e.subtitle ? (
+                      <div className="text-xs text-gray-500 mt-1 truncate">{e.subtitle}</div>
+                    ) : null}
 
                     <div className="text-xs text-gray-400 mt-1">
                       {e.whenLabel}
@@ -1482,7 +2217,11 @@ export default async function MarketPage(props: any) {
                   </div>
 
                   <div className="shrink-0 text-xs text-gray-400">
-                    {e.kind === "INCIDENT" ? "incident" : e.kind === "INTERVENTION" ? "itv" : "override"}
+                    {e.kind === "INCIDENT"
+                      ? "incident"
+                      : e.kind === "INTERVENTION"
+                        ? "itv"
+                        : "override"}
                     {typeof e.refId === "number" ? ` #${e.refId}` : ""}
                   </div>
                 </div>
@@ -1494,34 +2233,49 @@ export default async function MarketPage(props: any) {
         )}
       </section>
 
-      {/* Step 5 UI: Top traders */}
       <section id="traders" className="mt-12">
         <div className="flex items-end justify-between gap-4 mb-3 flex-wrap">
           <h2 className="font-medium">Top traders (30d)</h2>
           <div className="text-xs text-gray-500">Snapshot includes traders.summary</div>
         </div>
 
-        <TraderSummaryTable rows={traderSummary} />
+        {hasTraderSummary ? (
+          <TraderSummaryTable rows={traderSummary} />
+        ) : (
+          <div className="rounded-xl border bg-gray-50 px-3 py-3 text-sm text-gray-500">
+            Trader summaries are not yet available for this market window.
+          </div>
+        )}
       </section>
 
-      {/* Step 6.1 UI: Cohorts summary */}
       <section className="mt-12">
         <div className="flex items-end justify-between gap-4 mb-3 flex-wrap">
           <h2 className="font-medium">Cohorts summary (30d)</h2>
           <div className="text-xs text-gray-500">Snapshot includes traders.cohorts_summary</div>
         </div>
 
-        <CohortSummaryTable rows={cohortSummary} />
+        {hasCohortSummary ? (
+          <CohortSummaryTable rows={cohortSummary} />
+        ) : (
+          <div className="rounded-xl border bg-gray-50 px-3 py-3 text-sm text-gray-500">
+            Cohort summaries have not been generated yet for this market.
+          </div>
+        )}
       </section>
 
-      {/* Step 6.2 UI: Trader intelligence */}
       <section className="mt-12">
         <div className="flex items-end justify-between gap-4 mb-3 flex-wrap">
           <h2 className="font-medium">Trader intelligence (30d)</h2>
           <div className="text-xs text-gray-500">Snapshot includes traders.intelligence</div>
         </div>
 
-        <TraderIntelligenceTable rows={traderIntelligence} />
+        {hasTraderIntelligence ? (
+          <TraderIntelligenceTable rows={traderIntelligence} />
+        ) : (
+          <div className="rounded-xl border bg-gray-50 px-3 py-3 text-sm text-gray-500">
+            Trader intelligence is not available yet for this market window.
+          </div>
+        )}
       </section>
 
       <section id="operator-console" className="mt-12">
@@ -1537,13 +2291,16 @@ export default async function MarketPage(props: any) {
       <section id="timeline" className="mt-10">
         <div className="flex items-end justify-between gap-4 flex-wrap">
           <div>
-            <h2 className="font-medium">30-day timeline</h2>
-            <p className="text-xs text-gray-500 mt-1">Shows daily drift so ops can see whether a market is improving or deteriorating.</p>
+            <h2 className="font-medium">30 day timeline</h2>
+            <p className="text-xs text-gray-500 mt-1">
+              Shows daily drift so ops can see whether a market is improving or deteriorating.
+            </p>
           </div>
 
           {latest && prior ? (
             <div className="text-xs text-gray-600">
-              Comparing <span className="font-medium">{prior.day}</span> to <span className="font-medium">{latest.day}</span>
+              Comparing <span className="font-medium">{prior.day}</span> to{" "}
+              <span className="font-medium">{latest.day}</span>
             </div>
           ) : null}
         </div>
@@ -1570,10 +2327,12 @@ export default async function MarketPage(props: any) {
             </span>
           </div>
         ) : (
-          <div className="mt-3 text-sm text-gray-500">No timeline data available.</div>
+          <div className="mt-3 text-sm text-gray-500">
+            No historical market_day timeline available yet for this market.
+          </div>
         )}
 
-        {timelineSorted.length ? (
+        {hasTimeline ? (
           <div className="mt-4 overflow-x-auto border rounded-xl">
             <table className="w-full text-sm">
               <thead className="bg-gray-50 text-xs text-gray-600">
@@ -1604,7 +2363,11 @@ export default async function MarketPage(props: any) {
               </tbody>
             </table>
           </div>
-        ) : null}
+        ) : (
+          <div className="mt-4 rounded-xl border bg-gray-50 px-3 py-3 text-sm text-gray-500">
+            Timeline history has not been populated yet for this market.
+          </div>
+        )}
       </section>
 
       <section className="mt-12">
@@ -1612,7 +2375,7 @@ export default async function MarketPage(props: any) {
           Incident annotations <span className="text-xs text-gray-400">(with effectiveness)</span>
         </h2>
 
-        {incidentEffects.length ? (
+        {hasIncidentEffects ? (
           <div className="space-y-3">
             {incidentEffects.map((i) => (
               <div key={i.id} className="border rounded-xl p-4">
@@ -1645,27 +2408,49 @@ export default async function MarketPage(props: any) {
                         <div className="border rounded-lg p-3 bg-white">
                           <div className="text-xs text-gray-500 mb-2">Before</div>
                           <div className="flex flex-wrap gap-2">
-                            <span className="text-xs border rounded px-2 py-0.5">risk {fmtNumber(i.before.risk_score)}</span>
-                            <span className="text-xs border rounded px-2 py-0.5">spread {fmtFloat(i.before.spread_median, 4)}</span>
-                            <span className="text-xs border rounded px-2 py-0.5">depth {fmtNumber(i.before.depth_2pct_median)}</span>
-                            <span className="text-xs border rounded px-2 py-0.5">hhi {fmtFloat(i.before.concentration_hhi, 4)}</span>
-                            <span className="text-xs border rounded px-2 py-0.5">traders {fmtNumber(i.before.unique_traders)}</span>
+                            <span className="text-xs border rounded px-2 py-0.5">
+                              risk {fmtNumber(i.before.risk_score)}
+                            </span>
+                            <span className="text-xs border rounded px-2 py-0.5">
+                              spread {fmtFloat(i.before.spread_median, 4)}
+                            </span>
+                            <span className="text-xs border rounded px-2 py-0.5">
+                              depth {fmtNumber(i.before.depth_2pct_median)}
+                            </span>
+                            <span className="text-xs border rounded px-2 py-0.5">
+                              hhi {fmtFloat(i.before.concentration_hhi, 4)}
+                            </span>
+                            <span className="text-xs border rounded px-2 py-0.5">
+                              traders {fmtNumber(i.before.unique_traders)}
+                            </span>
                           </div>
                         </div>
 
                         <div className="border rounded-lg p-3 bg-white">
                           <div className="text-xs text-gray-500 mb-2">After</div>
                           <div className="flex flex-wrap gap-2">
-                            <span className="text-xs border rounded px-2 py-0.5">risk {fmtNumber(i.after.risk_score)}</span>
-                            <span className="text-xs border rounded px-2 py-0.5">spread {fmtFloat(i.after.spread_median, 4)}</span>
-                            <span className="text-xs border rounded px-2 py-0.5">depth {fmtNumber(i.after.depth_2pct_median)}</span>
-                            <span className="text-xs border rounded px-2 py-0.5">hhi {fmtFloat(i.after.concentration_hhi, 4)}</span>
-                            <span className="text-xs border rounded px-2 py-0.5">traders {fmtNumber(i.after.unique_traders)}</span>
+                            <span className="text-xs border rounded px-2 py-0.5">
+                              risk {fmtNumber(i.after.risk_score)}
+                            </span>
+                            <span className="text-xs border rounded px-2 py-0.5">
+                              spread {fmtFloat(i.after.spread_median, 4)}
+                            </span>
+                            <span className="text-xs border rounded px-2 py-0.5">
+                              depth {fmtNumber(i.after.depth_2pct_median)}
+                            </span>
+                            <span className="text-xs border rounded px-2 py-0.5">
+                              hhi {fmtFloat(i.after.concentration_hhi, 4)}
+                            </span>
+                            <span className="text-xs border rounded px-2 py-0.5">
+                              traders {fmtNumber(i.after.unique_traders)}
+                            </span>
                           </div>
                         </div>
                       </div>
 
-                      <div className="text-xs text-gray-500 mt-2">For risk, spread, and HHI: down is good. For depth and traders: up is good.</div>
+                      <div className="text-xs text-gray-500 mt-2">
+                        For risk, spread, and HHI: down is good. For depth and traders: up is good.
+                      </div>
                     </>
                   )}
                 </div>
@@ -1673,7 +2458,11 @@ export default async function MarketPage(props: any) {
             ))}
           </div>
         ) : (
-          <EmptyState text="No incidents recorded." />
+          <div className="rounded-2xl border bg-white p-6 shadow-sm">
+            <p className="text-sm text-gray-500">
+              No incident annotations recorded for this market yet.
+            </p>
+          </div>
         )}
       </section>
     </main>

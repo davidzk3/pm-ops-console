@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { fetchJSON } from "../lib/api";
+import { fetchJSON } from "../lib (rename back to lib)/api";
 
 type Props = {
   marketId: string;
