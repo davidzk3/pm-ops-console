@@ -365,7 +365,7 @@ export default async function MarketDetailPage({ params }: PageProps) {
       </div>
 
       <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
-        <p className="text-sm font-medium text-zinc-500">Market Detail TEST 123</p>
+        <p className="text-sm font-medium text-zinc-500">Market Detail</p>
 
         <div className="mt-1 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div>
