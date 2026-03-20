@@ -124,7 +124,7 @@ export default async function HomePage() {
         </p>
 
         <h1 className="mt-1 text-2xl font-semibold text-zinc-900">
-          Markets across structural quality and social demand signals
+          Markets across structural quality and demand signals
         </h1>
 
         <p className="mt-2 max-w-3xl text-sm text-zinc-600">
