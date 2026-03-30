@@ -102,7 +102,7 @@ export default async function HomePage() {
   try {
     socialCandidates = await getSocialCandidates(100);
   } catch {
-    // social is simulated for demo purposes
+    // demand layer is simulated for this MVP
   }
 
   const mergedMarkets = mergeMarkets(launchCandidates, socialCandidates, 100);
@@ -113,110 +113,120 @@ export default async function HomePage() {
     .slice(0, 30);
 
   return (
-    <div className="...">
-      <div className="w-full bg-gray-900 text-gray-200 text-sm text-center py-2 border-b border-gray-800">
-        This is a live demo environment. The backend may take a few seconds to initialize on first load. If the page doesn’t load immediately, please wait briefly and refresh.
+    <div className="min-h-screen bg-zinc-50">
+      <div className="w-full border-b border-gray-800 bg-gray-900 py-2 text-center text-sm text-gray-200">
+        This is a live demo environment. The backend may take a few seconds to
+        initialize on first load. If the page does not load immediately, please
+        wait briefly and refresh.
       </div>
-    <div className="mx-auto max-w-5xl space-y-8">
-      <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
-        <p className="text-sm font-medium text-zinc-500">
-          Prediction Market Intelligence
-        </p>
 
-        <h1 className="mt-1 text-2xl font-semibold text-zinc-900">
-          Markets across structural quality and demand signals
-        </h1>
+      <div className="mx-auto max-w-5xl space-y-8 px-4 py-8">
+        <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
+          <p className="text-sm font-medium text-zinc-500">
+            Prediction Market Intelligence
+          </p>
 
-        <p className="mt-2 max-w-3xl text-sm text-zinc-600">
-          This demo evaluates live markets along two separate dimensions.
-          Structural strength reflects liquidity quality, participation quality,
-          concentration, and durability, not volume alone. Social signal used is
-          simulated for demo purposes only and does not represent live social
-          ingestion.
-        </p>
-      </section>
+          <h1 className="mt-1 text-2xl font-semibold text-zinc-900">
+            Markets ranked by structural quality and demand alignment
+          </h1>
 
-      {pageError ? (
-        <section className="rounded-2xl border border-red-200 bg-red-50 p-5 text-red-700 shadow-sm">
-          {pageError}
+          <p className="mt-2 max-w-3xl text-sm text-zinc-600">
+            This system surfaces structural and demand signals across live
+            prediction markets. Structural strength reflects liquidity quality,
+            participation depth, concentration, and durability, not volume
+            alone.
+          </p>
+
+          <p className="mt-2 max-w-3xl text-sm text-zinc-600">
+            Demand is currently simulated while the ingestion and modeling layer
+            is under active development.
+          </p>
         </section>
-      ) : markets.length === 0 ? (
-        <section className="rounded-2xl border border-zinc-200 bg-white p-5 text-zinc-600 shadow-sm">
-          No markets found.
-        </section>
-      ) : (
-        <section className="space-y-4">
-          <div className="flex items-end justify-between gap-4">
-            <div>
-              <h2 className="text-xl font-semibold text-zinc-900">
-                Market Explorer
-              </h2>
-              <p className="mt-1 text-sm italic text-zinc-500">
-                Mixed live markets with real structural scoring and simulated social demo signals
-              </p>
+
+        {pageError ? (
+          <section className="rounded-2xl border border-red-200 bg-red-50 p-5 text-red-700 shadow-sm">
+            {pageError}
+          </section>
+        ) : markets.length === 0 ? (
+          <section className="rounded-2xl border border-zinc-200 bg-white p-5 text-zinc-600 shadow-sm">
+            No markets found.
+          </section>
+        ) : (
+          <section className="space-y-4">
+            <div className="flex items-end justify-between gap-4">
+              <div>
+                <h2 className="text-xl font-semibold text-zinc-900">
+                  Market Explorer
+                </h2>
+                <p className="mt-1 text-sm italic text-zinc-500">
+                  Live markets with structural scoring and simulated demand
+                  signals
+                </p>
+              </div>
+              <p className="text-sm text-zinc-500">{markets.length} markets</p>
             </div>
-            <p className="text-sm text-zinc-500">{markets.length} markets</p>
-          </div>
 
-          <div className="grid gap-6 lg:grid-cols-2">
-            {markets.map((item) => {
-              const structuralState = deriveDisplayStructuralState({
-                structuralScore: item.structural_score ?? null,
-                participationQuality: item.participation_quality_score ?? null,
-                liquidityDurability: item.liquidity_durability_score ?? null,
-                concentrationHHI: item.concentration_hhi ?? null,
-                fallbackRecommendation: item.structural_recommendation ?? null,
-              });
+            <div className="grid gap-6 lg:grid-cols-2">
+              {markets.map((item) => {
+                const structuralState = deriveDisplayStructuralState({
+                  structuralScore: item.structural_score ?? null,
+                  participationQuality: item.participation_quality_score ?? null,
+                  liquidityDurability: item.liquidity_durability_score ?? null,
+                  concentrationHHI: item.concentration_hhi ?? null,
+                  fallbackRecommendation:
+                    item.structural_recommendation ?? null,
+                });
 
-              const socialSignal = getDemoSocialSignal(item.market_id);
+                const socialSignal = getDemoSocialSignal(item.market_id);
 
-              const alignmentState = deriveDisplayAlignmentState(
-                structuralState,
-                socialSignal
-              );
+                const alignmentState = deriveDisplayAlignmentState(
+                  structuralState,
+                  socialSignal
+                );
 
-              return (
-                <CandidateCard
-                  key={item.market_id}
-                  marketId={item.market_id}
-                  title={item.title}
-                  category={item.category}
-                  structuralState={structuralState}
-                  socialSignal={socialSignal}
-                  scoreLabel="Structural quality score"
-                  scoreValue={
-                    item.structural_score !== null &&
-                    item.structural_score !== undefined
-                      ? formatNumber(item.structural_score)
-                      : "—"
-                  }
-                  summary={buildCardCommentary({
-                    structuralState,
-                    socialState: socialSignal,
-                    alignmentState,
-                    participationQuality:
-                      item.participation_quality_score ?? null,
-                    liquidityDurability:
-                      item.liquidity_durability_score ?? null,
-                    concentrationHHI: item.concentration_hhi ?? null,
-                    whaleShare: item.whale_share ?? null,
-                    speculativeShare: item.speculative_share ?? null,
-                    isSocialDemo: true,
-                  })}
-                  flags={deriveParticipantFlags({
-                    neutralShare: item.neutral_share ?? null,
-                    whaleShare: item.whale_share ?? null,
-                    speculativeShare: item.speculative_share ?? null,
-                    participationQuality:
-                      item.participation_quality_score ?? null,
-                  })}
-                  url={item.url}
-                />
-              );
-            })}
-          </div>
-        </section>
-      )}
+                return (
+                  <CandidateCard
+                    key={item.market_id}
+                    marketId={item.market_id}
+                    title={item.title}
+                    category={item.category}
+                    structuralState={structuralState}
+                    socialSignal={socialSignal}
+                    scoreLabel="Structural quality score"
+                    scoreValue={
+                      item.structural_score !== null &&
+                      item.structural_score !== undefined
+                        ? formatNumber(item.structural_score)
+                        : "—"
+                    }
+                    summary={buildCardCommentary({
+                      structuralState,
+                      socialState: socialSignal,
+                      alignmentState,
+                      participationQuality:
+                        item.participation_quality_score ?? null,
+                      liquidityDurability:
+                        item.liquidity_durability_score ?? null,
+                      concentrationHHI: item.concentration_hhi ?? null,
+                      whaleShare: item.whale_share ?? null,
+                      speculativeShare: item.speculative_share ?? null,
+                      isSocialDemo: true,
+                    })}
+                    flags={deriveParticipantFlags({
+                      neutralShare: item.neutral_share ?? null,
+                      whaleShare: item.whale_share ?? null,
+                      speculativeShare: item.speculative_share ?? null,
+                      participationQuality:
+                        item.participation_quality_score ?? null,
+                    })}
+                    url={item.url}
+                  />
+                );
+              })}
+            </div>
+          </section>
+        )}
+      </div>
     </div>
   );
 }
